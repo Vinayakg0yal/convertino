@@ -315,3 +315,26 @@ body.with-ask .hint { top: 394px; }
 .opts-mode input { margin: 2px 0 0; accent-color: var(--accent); }
 .opts-mode > span { display: flex; flex-direction: column; gap: 1px; }
 .opts-mode > span > span { font-size: 12px; color: var(--ink-2); }
+
+/* Folders: the hub's "this folder" line, the hint's main line, and the
+   options card (scrolls when a folder has many choices). */
+.hub .hm.sub { color: var(--ink-3); font-size: 10px; }
+.hint .hc { width: 100%; text-align: center; font-size: 12px; color: var(--ink); }
+.opts { max-height: 436px; overflow-y: auto; }
+.opts-keep[hidden] { display: none; }
+.opts-check small { display: block; font-size: 11.5px; color: var(--ink-2); margin-top: 1px; }
+.opts-check:has(small) { align-items: flex-start; }
+.opts-check:has(small) input { margin-top: 2px; }
+.opts-check input:disabled + span { opacity: 0.5; }
+.opts-field input[type="password"] {
+  height: 32px; border-radius: 5px; border: 1px solid var(--surface-line);
+  background: var(--hub-bg); color: var(--ink); font: inherit; padding: 0 8px;
+  user-select: text; -webkit-user-select: text; cursor: text;
+}
+.opts-field input:disabled, .opts select:disabled { opacity: 0.5; }
+.opts-field small { color: var(--ink-3); font-size: 11.5px; }
+.opts-note { margin: -6px 0 0; font-size: 11.5px; color: var(--ink-2); }
+.opts-note[hidden] { display: none; }
+/* A long options card scrolls; its buttons stay in view. */
+.opts .opts-buttons { position: sticky; bottom: -16px; margin: 0 -16px -16px; padding: 10px 16px 16px; background: var(--surface); }
+.opts > * { flex-shrink: 0; }

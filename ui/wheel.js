@@ -29,12 +29,22 @@ const ICONS = {
   pdf: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M8.5 16.5c2-1 4.5-5.5 3.5-6.5s-1 3 3.5 5"/>',
   camera: '<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13.5" r="3.2"/>',
   edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>',
+  join: '<rect x="3" y="7" width="7" height="10" rx="1.5"/><rect x="14" y="7" width="7" height="10" rx="1.5"/><path d="M10 12h4"/>',
+  fit: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9l6 6M15 9v6H9"/>',
+  pin: '<path d="M12 21s-6-5.6-6-11a6 6 0 0112 0c0 5.4-6 11-6 11z"/><path d="M4 4l16 16"/>',
+  eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  folder: '<path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/>',
   spark: '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M18.5 15.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/>',
 };
 const icon = (name, size = 20) =>
   `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.doc}</svg>`;
 const fileTile = (color, size = 28) =>
   `<svg width="${size}" height="${size * 1.2}" viewBox="0 0 20 24" aria-hidden="true"><path d="M3.5 1h9L17 5.5v17H3.5z" fill="var(--hub-bg)" stroke="var(--ink-3)"/><path d="M12.5 1v4.5H17" fill="none" stroke="var(--ink-3)"/><rect x="3.5" y="15" width="13.5" height="7.5" fill="${color}"/></svg>`;
+// A folder's tile in the hub.
+const folderTile = (size = 34) =>
+  `<svg width="${size}" height="${Math.round(size * 0.82)}" viewBox="0 0 44 36" aria-hidden="true"><path d="M2 6a3 3 0 013-3h11l4 4h19a3 3 0 013 3v21a3 3 0 01-3 3H5a3 3 0 01-3-3z" fill="#E8B84A"/><path d="M2 12h40v19a3 3 0 01-3 3H5a3 3 0 01-3-3z" fill="#F6CF65"/></svg>`;
+const isFolder = () => !!(model && model.folder);
+const tileFor = (size) => (isFolder() ? folderTile(size ? size + 6 : 34) : fileTile(model.hubColor, size));
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 
 const wheelEl = document.getElementById("wheel");
@@ -92,7 +102,7 @@ function draw() {
         (i < 9 && !s.tag && !size ? `<span class="key">${i + 1}</span>` : "") + `</div>`;
     })
     .join("");
-  const hub = size ? sizeHub() : `<div class="hub">${fileTile(model.hubColor)}<div class="hn" title="${esc(model.hubTitle)}">${esc(model.hubTitle)}</div><div class="hm">${esc(model.hubSubtitle)}</div></div>`;
+  const hub = size ? sizeHub() : `<div class="hub">${tileFor()}<div class="hn" title="${esc(model.hubTitle)}">${esc(model.hubTitle)}</div><div class="hm">${esc(model.hubSubtitle)}</div>${isFolder() && model.folder.blank ? '<div class="hm sub">this folder</div>' : ""}</div>`;
   const askBtn = showAsk() ? `<button type="button" class="ask" id="ask" aria-label="Ask Claude about ${esc(selectedWords())}">${icon("spark", 18)}<span>Ask Claude</span><span class="key">C</span></button>` : "";
   document.body.classList.toggle("with-ask", !!askBtn);
   wheelEl.innerHTML = `<svg viewBox="0 0 ${D} ${D}" aria-hidden="true">${segs}</svg>${labels}${hub}${askBtn}`;
@@ -147,6 +157,7 @@ function setActive(i) {
   wheelEl.querySelectorAll("[data-i]").forEach((el) => el.classList.toggle("on", Number(el.dataset.i) === i));
   const s = slots[i];
   if (size) return sizeHint(s);
+  if (isFolder()) return folderHint(s);
   if (!s) {
     const skipped = model && model.skipped.length ? ` · ${model.skipped.length} item${model.skipped.length > 1 ? "s" : ""} skipped` : "";
     hintEl.innerHTML = `<span class="hs">Point at a format${skipped}</span><span class="hk">1–${Math.min(9, slots.length)} to pick · arrows to move · Esc to cancel</span>`;
@@ -160,6 +171,170 @@ function setActive(i) {
     `<span class="hk">${how}</span>`;
 }
 
+// ---------- folders ----------
+// A folder's wheel: slots do something to everything inside (folder.rs).
+// Each slot's hint says what it touches, what it leaves alone and where the
+// result goes; Shift+click opens the folder options.
+
+const joinCheck = { words: null, pending: false, subfolders: null };
+
+function folderHint(s) {
+  const f = model.folder;
+  if (f.scanning !== null && f.scanning !== undefined) {
+    hintEl.innerHTML = `<span class="ht">Reading ${esc(f.name)}…</span><span class="hs">${esc(f.scanning.toLocaleString())} files so far</span><span class="hk">Esc to cancel</span>`;
+    return;
+  }
+  if (!s) {
+    const alone = f.alone ? ` · left alone: ${f.aloneWords}` : "";
+    const earlier = f.earlier ? ` · ${f.earlier} made by Convertino earlier` : "";
+    const subs = f.subfolders ? ` · ${f.subfolders} subfolder${f.subfolders === 1 ? "" : "s"}` : "";
+    const cut = f.truncated ? " · only the first 200,000 files were read" : "";
+    hintEl.innerHTML = `<span class="hs">Point at an action · ${esc(model.hubSubtitle)}${esc(subs)}${esc(earlier)}${esc(alone)}${esc(cut)}</span>` +
+      `<span class="hk">1–${Math.min(9, slots.length)} to pick · Shift+click for options · Esc to cancel</span>`;
+    return;
+  }
+  if (s.kind !== "target") {
+    hintEl.innerHTML = `<span class="ht">${esc(s.label)}</span><span class="hs">${esc(s.hint)}</span><span class="hk">Click to open</span>`;
+    return;
+  }
+  let what = s.hint;
+  if (s.id === "folder.join-video") {
+    if (joinCheck.words && joinCheck.subfolders === f.defaults.subfolders) what = joinCheck.words;
+    else { what = "Checking the clips…"; checkJoin(); }
+  }
+  const how = s.id === "folder.watch" ? "Click to set it up"
+    : s.id === "folder.fit" ? "Click to pick a size"
+    : FOLDER_OPTIONS[folderKind(s.id)] ? "Click to start · Shift+click for options" : "Click to start";
+  hintEl.innerHTML =
+    `<span class="ht">${esc(s.label)}</span>` + (s.sub && s.id !== "folder.watch" ? `<span class="hs">${esc(s.sub)}</span>` : "") +
+    `<span class="hc">${esc(what)}</span>` +
+    (s.detail ? `<span class="hk">${esc(s.detail)}</span>` : "") +
+    (s.out ? `<span class="hk">${esc(s.out)}</span>` : "") +
+    `<span class="hk">${how}</span>`;
+}
+
+function checkJoin() {
+  if (joinCheck.pending || !tauri) return;
+  joinCheck.pending = true;
+  const sub = model.folder.defaults.subfolders;
+  tauri.core.invoke("folder_join_check", { subfolders: sub }).then((r) => {
+    joinCheck.words = r.words; joinCheck.subfolders = sub; joinCheck.pending = false;
+    if (active >= 0 && slots[active] && slots[active].id === "folder.join-video" && !size) setActive(active);
+  }).catch((e) => { joinCheck.words = String(e); joinCheck.subfolders = sub; joinCheck.pending = false; });
+}
+
+/// The options group a folder slot uses.
+function folderKind(id) {
+  if (id === "folder.compress") return "compress";
+  if (id.startsWith("folder.to:") || id === "folder.audio" || id === "folder.normalize" || id === "folder.gps") return "batch";
+  if (id === "folder.pdf" || id === "folder.merge" || id === "folder.join-video" || id === "folder.join-audio" || id === "folder.sheets") return "ordered";
+  if (id === "folder.sequence") return "sequence";
+  if (id === "folder.zip") return "zip";
+  return "";
+}
+const FOLDER_OPTIONS = { compress: true, batch: true, ordered: true, sequence: true, zip: true };
+
+function folderDefaults() {
+  const d = (model.folder && model.folder.defaults) || { into: "new", subfolders: true, skipDone: true };
+  return { into: d.into, subfolders: d.subfolders, skipDone: d.skipDone, order: "name", fps: 24, format: "mp4", sound: false, gaps: "hold", pack: "zip", password: null, parts: null, fit: null };
+}
+
+/// How many files a slot touches with or without subfolders (the count on the ring is with the saved choice).
+function folderCount(s, subfolders) {
+  if (subfolders === model.folder.defaults.subfolders) return s.count;
+  const top = model.folder.topCounts || {};
+  if (!subfolders && top[s.id] !== undefined) return top[s.id];
+  return s.count;
+}
+
+function folderGo(s, opts, quality, remember) {
+  launch(s, { cmd: "folder_pick", actionId: s.id, label: s.label, opts, quality, remember: !!remember });
+}
+
+const FOLDER_VERB = { compress: "Compress", batch: "Convert", ordered: "Make", sequence: "Make", zip: "Zip" };
+const PARTS = [[0, "One file"], [18e6, "18 MB pieces (email)"], [100e6, "100 MB pieces"], [500e6, "500 MB pieces"], [2e9, "2 GB pieces (WhatsApp)"], [4e9, "4 GB pieces (USB stick)"]];
+
+function showFolderOptions(s) {
+  const kind = folderKind(s.id);
+  const f = model.folder;
+  const o = folderDefaults();
+  const q = Object.assign({}, DEFAULT_Q, (model && model.quality) || {});
+  optsFor = { slot: s, folder: o, q, kind };
+  document.getElementById("opts-title").textContent = s.label;
+  document.querySelector(".opts-sub").textContent = f.name;
+  optsKeep.nextElementSibling.textContent = "Use these every time";
+  optsKeep.checked = false;
+  optsKeep.closest("label").hidden = !(kind === "compress" || kind === "batch");
+  const radio = (name, v, label, sub, on) => `<label class="opts-mode"><input type="radio" name="${name}" value="${v}"${on ? " checked" : ""}><span><b>${esc(label)}</b><span>${esc(sub)}</span></span></label>`;
+  const check = (k, label, sub, on, disabled) => `<label class="opts-check"><input type="checkbox" data-f="${k}"${on ? " checked" : ""}${disabled ? " disabled" : ""}><span>${esc(label)}${sub ? `<small>${esc(sub)}</small>` : ""}</span></label>`;
+  const select = (k, label, options, value) => `<label class="opts-field"><span>${esc(label)}</span><select data-f="${k}">${options.map(([v, l]) => `<option value="${esc(v)}"${String(v) === String(value) ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></label>`;
+  const suffix = s.id === "folder.compress" ? "compressed" : s.id === "folder.normalize" ? "normalized" : s.id === "folder.gps" ? "no GPS" : s.id === "folder.audio" ? "mp3" : s.label.replace(/^.* → /, "").toLowerCase();
+  const subs = f.subfolders ? check("subfolders", "Include subfolders", `${f.subfolders} subfolder${f.subfolders === 1 ? "" : "s"}, ${f.inSubfolders} of the ${f.files} files`, o.subfolders) : "";
+  let html = "";
+  if (kind === "compress" || kind === "batch") {
+    html += `<fieldset class="opts-modes"><legend>Put the results</legend>` +
+      radio("into", "new", "In a new folder next to it", `${f.name} (${suffix}), same subfolders inside`, o.into === "new") +
+      radio("into", "beside", "Next to each original", `“name (${suffix})” beside each file`, o.into === "beside") +
+      radio("into", "replace", "Replace the originals", "Each original moves to “Convertino originals” next to the folder once its new copy checks out", o.into === "replace") +
+      `</fieldset>` + subs +
+      check("skipDone", "Skip files already done", "A result from an earlier run that's still there and newer than the original", o.skipDone);
+    if (kind === "compress") html += select("look", "Look", [["small", "Smaller: looks very close"], ["balanced", "Balanced: looks the same"], ["best", "Best: the same, even side by side"]], q.video);
+  } else if (kind === "ordered") {
+    html += select("order", "Order", [["name", "By name (2 before 10)"], ["date", "By date modified"]], o.order) + subs;
+  } else if (kind === "sequence") {
+    const seq = f.sequence || { frames: s.count, gaps: 0 };
+    html += select("fps", "Frame rate", [[23.976, "23.976 fps"], [24, "24 fps"], [25, "25 fps"], [30, "30 fps"], [50, "50 fps"], [60, "60 fps"]], o.fps) +
+      select("format", "Make", [["mp4", "MP4 (H.264), looks the same"], ["h265", "MP4 (H.265), smaller"], ["prores", "ProRes 422 HQ (.mov, for editing)"], ["webm", "WebM (VP9, keeps transparency)"], ["gif", "GIF (480 px, 15 fps)"]], o.format) +
+      (f.sound ? check("sound", "Add sound", `Uses the audio file in the folder: ${f.sound}`, o.sound) : "") +
+      (seq.gaps ? select("gaps", `${seq.gaps} frame${seq.gaps === 1 ? " is" : "s are"} missing`, [["hold", "Hold the previous frame"], ["stop", "Stop and say which"]], o.gaps) : "");
+  } else if (kind === "zip") {
+    html += select("pack", "Format", [["zip", "ZIP (opens anywhere)"], ["7z", "7Z (smaller, needs 7-Zip)"], ["targz", "TAR.GZ"]], o.pack) +
+      `<label class="opts-field"><span>Password <small>(optional)</small></span><input type="password" data-f="password" autocomplete="new-password" placeholder="No password"></label>` +
+      `<p class="opts-note" data-note="pw" hidden>Password-protected archives use AES-256: open them with 7-Zip or Convertino (Windows' built-in zip can't).</p>` +
+      select("parts", "Split into", PARTS, 0) + subs;
+  }
+  optsFields.innerHTML = html;
+  folderGoLabel();
+  optsEl.hidden = false;
+  document.body.classList.add("with-opts");
+  hintEl.classList.remove("show");
+  const first = optsFields.querySelector("input:checked, select, input");
+  if (first) first.focus();
+}
+
+function folderGoLabel() {
+  const { slot, folder, kind } = optsFor;
+  const n = folderCount(slot, folder.subfolders);
+  const verb = FOLDER_VERB[kind] || "Start";
+  const what = kind === "sequence" ? `${(slot.label.includes("GIF") || folder.format === "gif") ? "the GIF" : "the video"}` : `${n} file${n === 1 ? "" : "s"}`;
+  document.getElementById("opts-go").textContent = `${verb} ${what}`;
+}
+
+function folderOptionInput(e) {
+  const t = e.target;
+  const o = optsFor.folder;
+  if (t.name === "into") o.into = t.value;
+  const k = t.dataset.f;
+  if (k === "subfolders" || k === "skipDone" || k === "sound") o[k] = t.checked;
+  else if (k === "fps") o.fps = Number(t.value);
+  else if (k === "parts") o.parts = Number(t.value) || null;
+  else if (k === "password") {
+    o.password = t.value || null;
+    const note = optsFields.querySelector('[data-note="pw"]');
+    if (note) note.hidden = !t.value;
+  } else if (k === "pack") {
+    o.pack = t.value;
+    const pw = optsFields.querySelector('[data-f="password"]');
+    if (pw) { pw.disabled = t.value === "targz"; if (pw.disabled) { pw.value = ""; o.password = null; } }
+    const parts = optsFields.querySelector('[data-f="parts"]');
+    if (parts) { parts.disabled = t.value === "targz"; if (parts.disabled) { parts.value = "0"; o.parts = null; } }
+  } else if (k === "look") {
+    const g = t.value;
+    optsFor.q.video = g; optsFor.q.image = g; optsFor.q.pdfCompress = g === "best" ? "high" : g;
+  } else if (k) o[k] = t.value;
+  folderGoLabel();
+}
+
 // ---------- open / close / pick ----------
 
 let openCount = 0;          // bumps on every open, so a stale pick can tell
@@ -171,6 +346,7 @@ function open(m) {
   early.clear();
   model = m;
   busy = false;
+  joinCheck.words = null; joinCheck.pending = false;
   document.documentElement.dataset.os = m.os;
   if (m.accent) document.documentElement.style.setProperty("--accent", m.accent);
   page = "main";
@@ -217,6 +393,11 @@ function choose(i, withOptions = false) {
   if (s.kind === "size") return startSize(s.bytes, s.label, null);
   if (s.kind === "custom") return openCustom("");
   if (s.kind === "target" && COMPRESS.has(s.id)) return enterSize(s);
+  if (isFolder()) {
+    if (s.id === "folder.fit") return enterSize(s);
+    if (withOptions && FOLDER_OPTIONS[folderKind(s.id)]) return showFolderOptions(s);
+    return folderGo(s, folderDefaults(), null, false);
+  }
   if (withOptions && OPTIONS[s.id]) return showOptions(s);
   start(s, null, false);
 }
@@ -226,12 +407,16 @@ function start(s, quality, remember) {
 }
 
 function launch(s, args) {
-  // Edit opens an editor window (PDF or image) instead of converting; with the ring
-  // turned off in Settings, progress goes straight to the corner card.
-  if (/\.edit$/.test(args.targetId) || (model && model.ring === false)) {
-    return animateOut(() => tauri && tauri.core.invoke("wheel_pick", args));
+  const cmd = args.cmd || "wheel_pick";
+  const call = Object.assign({}, args);
+  delete call.cmd;
+  // Edit opens an editor window (PDF or image) instead of converting; Watch
+  // opens Settings; with the ring turned off in Settings, progress goes
+  // straight to the corner card.
+  if (/\.edit$/.test(args.targetId || "") || args.actionId === "folder.watch" || (model && model.ring === false)) {
+    return animateOut(() => tauri && tauri.core.invoke(cmd, call).catch((e) => console.error(e)));
   }
-  pick(s, args);
+  pick(s, cmd, call);
 }
 
 // ---------- Shift+click options ----------
@@ -324,6 +509,7 @@ const optsKeep = document.getElementById("opts-keep");
 let optsFor = null;   // { slot, q }
 
 function showOptions(s) {
+  if (isFolder()) return showFolderOptions(s);
   const q = Object.assign({}, DEFAULT_Q, (model && model.quality) || {});
   optsFor = { slot: s, q };
   document.getElementById("opts-title").textContent = s.label;
@@ -367,12 +553,15 @@ function showAskOptions() {
 
 function hideOptions() {
   optsFor = null;
+  const keep = optsKeep && optsKeep.closest("label");
+  if (keep) keep.hidden = false;
   if (optsEl) optsEl.hidden = true;
   document.body.classList.remove("with-opts");
 }
 
 if (optsEl) {
   optsFields.addEventListener("input", (e) => {
+    if (optsFor && optsFor.folder) return folderOptionInput(e);
     if (optsFor && optsFor.ask && e.target.name === "askmode") { optsFor.mode = e.target.value; return; }
     const tkey = e.target.dataset.tune;
     if (tkey && optsFor) {
@@ -396,6 +585,7 @@ if (optsEl) {
     }
   });
   optsFields.addEventListener("change", (e) => {
+    if (optsFor && optsFor.folder) return folderOptionInput(e);
     if (e.target.type === "checkbox" && e.target.dataset.tune && optsFor) setQuickTune(e.target.dataset.tune, e.target.checked);
   });
   optsEl.addEventListener("submit", (e) => {
@@ -406,6 +596,11 @@ if (optsEl) {
       const mode = optsFor.mode;
       hideOptions();
       return askGo(mode, remember);
+    }
+    if (optsFor.folder) {
+      const { slot, folder, q, kind } = optsFor;
+      hideOptions();
+      return folderGo(slot, folder, kind === "compress" ? q : null, remember);
     }
     const { slot, q } = optsFor;
     hideOptions();
@@ -438,7 +633,8 @@ function words(bytes) {
 }
 
 function enterSize(s) {
-  size = { slot: s, together: true, ring: null, custom: false, text: "", unit: "MB", preview: null, previewFor: "", loading: true, error: null };
+  size = { slot: s, together: true, ring: null, custom: false, text: "", unit: "MB", preview: null, previewFor: "", loading: true, error: null,
+    folder: s.id === "folder.fit", mode: "folder", measure: null };
   slots = [];
   draw();
   loadPresets();
@@ -449,14 +645,22 @@ function loadPresets() {
   const mine = size;
   mine.loading = true;
   if (!tauri) return demoPresets(mine);
-  tauri.core.invoke("compress_presets", { targetId: mine.slot.id, family: mine.slot.family, together: mine.together })
+  const call = mine.folder
+    ? tauri.core.invoke("folder_fit_presets", { mode: mine.mode, subfolders: model.folder.defaults.subfolders })
+    : tauri.core.invoke("compress_presets", { targetId: mine.slot.id, family: mine.slot.family, together: mine.together });
+  call
     .then((r) => { if (size === mine) { mine.ring = r; mine.loading = false; mine.unit = defaultUnit(r); showSizes(); } })
     .catch((e) => { if (size === mine) { mine.loading = false; mine.error = String(e); showSizes(); } });
 }
 
 function defaultUnit(r) {
+  if (r && r.total >= 5e9) return "GB";
   return r && r.total < 2e6 ? "KB" : "MB";
 }
+const UNIT = { KB: 1e3, MB: 1e6, GB: 1e9 };
+const nextUnit = (u) => (u === "KB" ? "MB" : u === "MB" ? "GB" : "KB");
+const FIT_MODES = [["folder", "Folder"], ["zip", "Zip"], ["parts", "Parts"]];
+const FIT_SAY = { folder: "A compressed copy of the folder", zip: "One zip, media shrunk just enough", parts: "An untouched zip in pieces" };
 
 function showSizes() {
   const r = size.ring;
@@ -468,10 +672,13 @@ function showSizes() {
   draw();
 }
 
-const multi = () => size && size.ring && size.ring.count > 1;
-const scope = () => (multi() ? (size.together ? "All together under " : "Each under ") : "Under ");
+const multi = () => size && !size.folder && size.ring && size.ring.count > 1;
+const scope = () => (size && size.folder ? (size.mode === "parts" ? "Pieces of " : "All under ") : multi() ? (size.together ? "All together under " : "Each under ") : "Under ");
 
 function toggleHtml() {
+  if (size && size.folder) {
+    return `<div class="seg-toggle" role="group" aria-label="Make">${FIT_MODES.map(([v, l]) => `<button type="button" class="seg-btn${size.mode === v ? " on" : ""}" data-mode="${v}" aria-pressed="${size.mode === v}">${l}</button>`).join("")}</div>`;
+  }
   if (!multi()) return "";
   const b = (v, label) => `<button type="button" class="seg-btn${size.together === v ? " on" : ""}" data-together="${v}" aria-pressed="${size.together === v}">${label}</button>`;
   return `<div class="seg-toggle" role="group" aria-label="The size is for">${b(false, "Each")}${b(true, "Together")}</div>`;
@@ -479,17 +686,18 @@ function toggleHtml() {
 
 function sizeHub() {
   if (size.loading) {
-    return `<div class="hub size-hub">${fileTile(model.hubColor, 22)}<div class="hm">Measuring…</div></div>`;
+    const m = size.measure ? ` ${size.measure.done} of ${size.measure.total}` : "";
+    return `<div class="hub size-hub">${tileFor(22)}<div class="hm">Measuring…${esc(m)}</div></div>`;
   }
   const title = (size.ring && size.ring.title) || model.hubTitle;
   if (!size.custom) {
-    return `<div class="hub size-hub"><div class="hm">Compress to</div><div class="hn" title="${esc(title)}">${esc(title)}</div>${toggleHtml()}` +
+    return `<div class="hub size-hub"><div class="hm">${size.folder ? "Fit" : "Compress to"}</div><div class="hn" title="${esc(title)}">${esc(title)}</div>${toggleHtml()}` +
       `<button type="button" class="hub-btn" data-act="back">Back</button></div>`;
   }
   const p = size.preview && size.previewFor === typedKey() ? size.preview : null;
   const go = !p ? "Compress" : p.fits ? "OK" : p.ok ? "Compress" : `Make ${words(p.min)}`;
   return `<form class="hub size-hub custom" autocomplete="off">` +
-    (multi() ? toggleHtml() : `<label class="hm" for="size-box">No bigger than</label>`) +
+    (multi() || size.folder ? toggleHtml() : `<label class="hm" for="size-box">No bigger than</label>`) +
     `<div class="size-row"><input id="size-box" type="text" inputmode="decimal" aria-label="Size" value="${esc(size.text)}" spellcheck="false">` +
     `<button type="button" class="unit" data-act="unit" aria-label="Unit: ${size.unit}, click to switch">${size.unit}</button></div>` +
     `<div class="size-row"><button type="button" class="hub-btn icon" data-act="close" aria-label="Back to the sizes">${icon("back", 14)}</button>` +
@@ -500,9 +708,13 @@ function wireSizeHub() {
   const hub = wheelEl.querySelector(".hub");
   if (!hub) return;
   hub.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-act], [data-together]");
+    const t = e.target.closest("[data-act], [data-together], [data-mode]");
     if (!t) return;
     e.stopPropagation();
+    if (t.dataset.mode) {
+      if (size.mode !== t.dataset.mode) { size.mode = t.dataset.mode; size.preview = null; size.previewFor = ""; loadPresets(); if (size.custom) { redrawCustom(); refreshPreview(); } }
+      return;
+    }
     if (t.dataset.together) {
       const v = t.dataset.together === "true";
       if (size.together !== v) { size.together = v; size.preview = null; size.previewFor = ""; loadPresets(); if (size.custom) refreshPreview(); }
@@ -510,7 +722,7 @@ function wireSizeHub() {
     }
     if (t.dataset.act === "back") return leaveSize();
     if (t.dataset.act === "close") return closeCustom();
-    if (t.dataset.act === "unit") { size.unit = size.unit === "MB" ? "KB" : "MB"; redrawCustom(); return refreshPreview(); }
+    if (t.dataset.act === "unit") { size.unit = size.folder ? nextUnit(size.unit) : size.unit === "MB" ? "KB" : "MB"; redrawCustom(); return refreshPreview(); }
   });
   const form = hub.tagName === "FORM" ? hub : null;
   if (!form) return;
@@ -525,7 +737,7 @@ function wireSizeHub() {
   box.addEventListener("keydown", (e) => {
     // "k" and "m" pick the unit while typing.
     const k = e.key.toLowerCase();
-    if (k === "k" || k === "m") { e.preventDefault(); size.unit = k === "k" ? "KB" : "MB"; redrawCustom(); refreshPreview(); }
+    if (k === "k" || k === "m" || (k === "g" && size.folder)) { e.preventDefault(); size.unit = k === "k" ? "KB" : k === "g" ? "GB" : "MB"; redrawCustom(); refreshPreview(); }
   });
   box.focus();
   box.setSelectionRange(box.value.length, box.value.length);
@@ -543,9 +755,9 @@ function redrawCustom() {
 
 function typedBytes() {
   const n = parseFloat(size.text);
-  return n > 0 ? Math.round(n * (size.unit === "KB" ? 1e3 : 1e6)) : 0;
+  return n > 0 ? Math.round(n * UNIT[size.unit]) : 0;
 }
-const typedKey = () => `${typedBytes()}|${size.together}`;
+const typedKey = () => `${typedBytes()}|${size.together}|${size.mode}`;
 
 let previewTimer = 0;
 function refreshPreview() {
@@ -563,8 +775,10 @@ function refreshPreview() {
       if (active < 0 || active === slots.length - 1) sizeHint(null);
     };
     if (!tauri) return got(demoPreview(bytes));
-    tauri.core.invoke("compress_preview", { targetId: mine.slot.id, family: mine.slot.family, bytes, together: mine.together, trim: null })
-      .then(got).catch(() => {});
+    const call = mine.folder
+      ? tauri.core.invoke("folder_fit_preview", { bytes, mode: mine.mode, subfolders: model.folder.defaults.subfolders })
+      : tauri.core.invoke("compress_preview", { targetId: mine.slot.id, family: mine.slot.family, bytes, together: mine.together, trim: null });
+    call.then(got).catch(() => {});
   }, 120);
 }
 
@@ -606,6 +820,10 @@ function submitCustom() {
 function startSize(bytes, label, trim) {
   if (!size || busy) return;
   const s = size.slot;
+  if (size.folder) {
+    const opts = Object.assign(folderDefaults(), { fit: { bytes, mode: size.mode } });
+    return launch({ label }, { cmd: "folder_pick", actionId: s.id, label: `Fit in ${label}`, opts, quality: null, remember: false });
+  }
   launch({ label }, {
     targetId: s.id, label, family: s.family, quality: null, remember: false,
     size: { bytes, together: size.together && multi(), trim },
@@ -623,7 +841,8 @@ function sizeHint(s) {
     return;
   }
   if (size.loading) {
-    hintEl.innerHTML = `<span class="hs">Working out the sizes for ${esc(model.hubTitle)}…</span><span class="hk">Esc goes back</span>`;
+    const m = size.measure ? ` (${size.measure.done} of ${size.measure.total} measured)` : "";
+    hintEl.innerHTML = `<span class="hs">Working out the sizes for ${esc(model.hubTitle)}…${esc(m)}</span><span class="hk">Esc goes back</span>`;
     return;
   }
   if (s && s.kind === "custom" && !size.custom) {
@@ -653,6 +872,12 @@ function sizeHint(s) {
     return;
   }
   const title = (size.ring && size.ring.title) || model.hubTitle;
+  if (size.folder) {
+    const none = size.ring && !size.ring.presets.length ? " · no common size fits this folder: type one" : "";
+    const what = size.error ? size.error : `${FIT_SAY[size.mode]} · ${words(size.ring ? size.ring.total : 0)} now${none}`;
+    hintEl.innerHTML = `<span class="ht">Fit ${esc(title)}</span><span class="hs">${esc(what)}</span><span class="hk">${keys.replace("compress", "start")}</span>`;
+    return;
+  }
   const what = size.error ? size.error
     : multi() ? (size.together ? `Sizes for all ${size.ring.count} together, or switch to each` : `Sizes for each of the ${size.ring.count}`)
     : `Sizes picked for this ${words(size.ring ? size.ring.total : 0)} file`;
@@ -669,7 +894,7 @@ function sizeKey(e) {
   }
   if (inBox) return true; // typing in the box
   if (e.key === "Backspace" && !size.custom) { e.preventDefault(); leaveSize(); return true; }
-  if (/^[0-9.]$/.test(e.key) && !e.ctrlKey && !e.metaKey && !e.altKey) {
+  if (/^[0-9.]$/.test(e.key) && !e.ctrlKey && !e.metaKey && !e.altKey && !size.loading) {
     e.preventDefault();
     if (!size.custom) openCustom(e.key);
     return true;
@@ -704,14 +929,14 @@ const early = new Map();    // job events that arrived before the pick returned 
 const TICK = '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-label="Done"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
 const UNDONE = '<svg class="undone" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-label="Undone"><path d="M9 14L4 9l5-5M4 9h10a6 6 0 010 12h-3"/></svg>';
 
-function pick(s, args) {
+function pick(s, cmd, args) {
   busy = true;
   const pickedAt = performance.now();
   hintEl.classList.remove("show");
   wheelEl.classList.add("collapsing");
   const collapse = new Promise((r) => setTimeout(r, 180));
   if (!tauri) return demoRing(s, collapse);
-  const picked = tauri.core.invoke("wheel_pick", args);
+  const picked = tauri.core.invoke(cmd, args);
   const openedAs = openCount;
   Promise.all([picked, collapse]).then(async ([id]) => {
     // A new wheel opened meanwhile: it has handed this job to the corner card.
@@ -754,7 +979,8 @@ function ringProgress(p) {
   // A converter downloading on first use: just its percentage (the corner
   // card, after the hand-over, says what's downloading).
   if (rp) rp.textContent = String(p.detail)
-    .replace(/^File (\d+) of (\d+)$/, "$1 / $2")
+    .replace(/^File (\d+) of (\d+)( · .*)?$/, "$1 / $2")
+    .replace(/^Getting ready…$/, "…")
     .replace(/^Downloading .* · (\d+%|\d+ MB)$/, "↓ $1")
     .replace(/^(Setting up|Installing) .*$/, "…");
 }
@@ -916,6 +1142,30 @@ document.addEventListener("keydown", (e) => {
 
 if (tauri) {
   tauri.event.listen("wheel-open", (ev) => open(ev.payload));
+  // A big folder finished reading: the same wheel, now with its slots.
+  tauri.event.listen("wheel-update", (ev) => {
+    if (!model || !model.folder || busy || ring) return;
+    model = ev.payload;
+    page = "main";
+    size = null;
+    slots = model.main;
+    draw();
+  });
+  tauri.event.listen("wheel-scan", (ev) => {
+    if (!model || !model.folder || model.folder.scanning === null || model.folder.scanning === undefined) return;
+    model.folder.scanning = ev.payload;
+    model.hubSubtitle = `Reading… ${Number(ev.payload).toLocaleString()} files`;
+    const hm = wheelEl.querySelector(".hub .hm");
+    if (hm) hm.textContent = model.hubSubtitle;
+    if (active < 0) setActive(-1);
+  });
+  tauri.event.listen("fit-measure", (ev) => {
+    if (!size || !size.folder || !size.loading) return;
+    size.measure = ev.payload;
+    const hm = wheelEl.querySelector(".size-hub .hm");
+    if (hm) hm.textContent = `Measuring… ${ev.payload.done} of ${ev.payload.total}`;
+    sizeHint(null);
+  });
   const remember = (id, key, value) => early.set(id, Object.assign(early.get(id) || {}, { [key]: value }));
   tauri.event.listen("job-progress", (ev) => {
     const p = ev.payload;
@@ -938,6 +1188,31 @@ if (tauri) {
   // Opened in a normal browser: show a sample so the design can be checked.
   document.documentElement.style.background = "#6b7a8f";
   const t = (id, label, icon, hint) => ({ id, label, icon, hint, family: "pdf", tag: null, kind: "target", count: 1 });
+  // ?folder: a sample folder wheel.
+  const fs = (id, label, icon, count, sub, hint, detail, out) => ({ id, label, icon, hint, family: "folder", tag: null, kind: "target", count, sub, detail, out });
+  if (/folder/.test(location.search)) {
+    open({
+      os: /Mac/.test(navigator.platform) ? "mac" : "win", accent: null, files: [], skipped: ["Valorant clips"],
+      hubTitle: "Valorant clips", hubSubtitle: "44 files · 14.50 GB", hubFamily: "folder", hubColor: "#E8B84A",
+      ring: true, handoffMs: 2000, quality: DEFAULT_Q, presets: {}, ask: null,
+      folder: { name: "Valorant clips", roots: ["E:\\Videos\\Valorant clips"], files: 44, inSubfolders: 9, subfolders: 3, bytes: 14.5e9, alone: 2, aloneWords: "1 hidden, 1 system file", blank: false, truncated: false, scanning: null,
+        defaults: { into: "new", subfolders: true, skipDone: true }, sequence: null, sound: null, topCounts: { "folder.compress": 35, "folder.zip": 35, "folder.fit": 35 } },
+      main: [
+        fs("folder.compress", "Compress all", "compress", 44, "44 files", "Smallest that looks the same · 40 videos, 4 pictures", "Leaves 2 hidden or system files alone", "→ new folder Valorant clips (compressed)"),
+        fs("folder.to:video.mp4", "All → MP4", "video", 2, "2 videos", "Only 2 videos need it · 38 already MP4 (left alone)", "Leaves 42 files alone", "→ new folder Valorant clips (mp4)"),
+        fs("folder.join-video", "Join clips", "join", 40, "40 videos", "One video, in name order", "Leaves 4 files alone", "→ Valorant clips.mp4 next to the folder"),
+        fs("folder.audio", "Audio only", "audio", 40, "40 videos", "MP3 from every video · About 245 kbps", "Leaves 4 files alone", "→ new folder Valorant clips (mp3)"),
+        fs("folder.fit", "Fit to size", "fit", 44, "14.50 GB →", "Make the folder fit a size: a compressed copy, one zip, or a zip in parts", null, "Pick the size next"),
+        fs("folder.zip", "Zip", "archive", 44, "44 files", "Videos and pictures go in as they are (they're compressed already): fast", "Hidden and system files are left out (2)", "→ Valorant clips.zip next to the folder · Shift+click: 7Z, TAR.GZ, password, parts"),
+        { id: "more", label: "More", icon: "more", hint: "More: Remove GPS, Watch this folder…", family: "folder", tag: null, kind: "more", count: 2, sub: "2" },
+      ],
+      more: [
+        fs("folder.gps", "Remove GPS", "pin", 4, "4 pictures", "Location removed from every picture that has one · pixels untouched", "Leaves 40 files alone", "→ new folder Valorant clips (no GPS)"),
+        fs("folder.watch", "Watch this folder…", "eye", 0, null, "Convert new files as they arrive", null, "Opens Settings › Watched folders"),
+        { id: "back", label: "Back", icon: "back", hint: "Back to the folder wheel", family: "folder", tag: null, kind: "back", count: 0 },
+      ],
+    });
+  } else
   open({
     os: /Mac/.test(navigator.platform) ? "mac" : "win",
     accent: null,

@@ -10,6 +10,7 @@ const NAV = [
   { id: "wheel", label: "Wheel", icon: "M12 3a9 9 0 100 18 9 9 0 000-18z M12 8.5a3.5 3.5 0 100 7 3.5 3.5 0 000-7z M12 3v5.5 M12 15.5V21 M3 12h5.5 M15.5 12H21" },
   { id: "quality", label: "Quality", icon: "M4 21v-7 M4 10V3 M12 21v-9 M12 8V3 M20 21v-5 M20 12V3 M1 14h6 M9 8h6 M17 16h6" },
   { id: "converters", label: "Converters", icon: "M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.8-3.8a6 6 0 01-7.9 7.9l-6.9 6.9a2.1 2.1 0 01-3-3l6.9-6.9a6 6 0 017.9-7.9z" },
+  { id: "watch", label: "Watched folders", icon: "M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z M12 9a3 3 0 100 6 3 3 0 000-6z" },
   { id: "ai", label: "AI & CLI", icon: "M4 17l6-5-6-5 M12 19h8" },
   { id: "about", label: "About", icon: "M12 3a9 9 0 100 18 9 9 0 000-18z M12 16v-4 M12 8h.01" },
 ];
@@ -208,6 +209,7 @@ function setPage(p) {
   render();
   $("main").scrollTop = 0;
   if (p === "converters") refreshTools();
+  if (p === "watch") takePendingWatch();
   if (p === "ai") refreshAi();
   if (p === "quality") loadTuneInfo();
 }
@@ -257,6 +259,7 @@ function render() {
   renderWheel();
   renderQuality();
   renderConverters();
+  renderWatch();
   $("version").textContent = `Convertino ${view.version}`;
 }
 
@@ -1101,6 +1104,96 @@ $("cli-install").addEventListener("click", async () => {
   b.disabled = false;
 });
 
+// ---------- Watched folders ----------
+// New files in a watched folder are converted on their own (watch.rs).
+
+let watchActions = null;
+const INTO = [["new", "Into a new folder next to it"], ["beside", "Next to the original"], ["replace", "Replace the original"]];
+
+async function loadWatchActions() {
+  if (watchActions) return watchActions;
+  watchActions = await invoke("watch_actions").catch(() => [["folder.compress", "Compress"]]);
+  return watchActions;
+}
+
+function ago(secs) {
+  const d = Math.max(0, Date.now() / 1000 - secs);
+  if (d < 60) return "just now";
+  if (d < 3600) return `${Math.round(d / 60)} min ago`;
+  if (d < 86400) return `${Math.round(d / 3600)} h ago`;
+  return new Date(secs * 1000).toLocaleDateString();
+}
+
+function intoWords(w) {
+  const name = w.path.split(/[\\/]/).filter(Boolean).pop() || w.path;
+  const sfx = { "folder.compress": "compressed", "folder.gps": "no GPS", "folder.normalize": "normalized", "folder.audio": "mp3" }[w.action] || (w.action.split(".").pop() || "");
+  return { new: `Results go in “${name} (${sfx})” next to it`, beside: "Results go next to each original", replace: "The original moves to “Convertino originals” next to this folder once its new copy checks out" }[w.into];
+}
+
+async function renderWatch() {
+  const box = $("watch-list");
+  if (!box || !view) return;
+  const list = view.settings.watched || [];
+  const actions = await loadWatchActions();
+  if (!list.length) {
+    box.innerHTML = `<div class="item"><div class="grow"><div>No folders yet</div><div class="sub">Alt+right-click a folder › More › Watch this folder…, or choose one here.</div></div></div>`;
+    return;
+  }
+  box.innerHTML = list.map((w, i) => {
+    const last = w.last ? `Last: ${ago(w.last.at)} · ${esc(w.last.file)} · <span class="${w.last.ok ? "" : "warn"}">${esc(w.last.result)}</span>` : w.on ? "Waiting for a new file" : "Paused";
+    const opt = (pairs, v) => pairs.map(([id, l]) => `<option value="${esc(id)}"${id === v ? " selected" : ""}>${esc(l)}</option>`).join("");
+    return `<div class="item watch${w.on ? "" : " off"}" data-i="${i}">` +
+      `<div class="grow"><div class="name mono" title="${esc(w.path)}">${esc(w.path)}</div>` +
+      `<div class="watch-sel"><select data-w="action" aria-label="What to do with each new file">${opt(actions, w.action)}</select>` +
+      `<select data-w="into" aria-label="Where results go">${opt(INTO, w.into)}</select></div>` +
+      `<div class="sub">${esc(intoWords(w))}</div><div class="sub">${last}</div></div>` +
+      `<button type="button" class="link" data-w="remove">Remove</button>` +
+      `<button type="button" class="switch" role="switch" data-w="on" aria-checked="${w.on}" aria-label="Watch ${esc(w.path)}"><span></span></button></div>`;
+  }).join("");
+}
+
+async function setWatched(list) {
+  await save({ watched: list });
+}
+
+async function addWatch(path) {
+  const list = (view.settings.watched || []).slice();
+  if (list.some((w) => w.path === path)) { toast("Already watched"); return; }
+  list.push({ path, action: "folder.compress", into: "new", on: true, last: null });
+  await setWatched(list);
+  toast("Watching it: new files there will be compressed. Change what happens below.");
+}
+
+async function takePendingWatch() {
+  const p = await invoke("watch_take_pending").catch(() => null);
+  if (p && view) addWatch(p);
+}
+
+if ($("watch-list")) {
+  $("watch-list").addEventListener("change", (e) => {
+    const row = e.target.closest("[data-i]");
+    if (!row) return;
+    const list = (view.settings.watched || []).map((w) => Object.assign({}, w));
+    const w = list[Number(row.dataset.i)];
+    w[e.target.dataset.w] = e.target.value;
+    setWatched(list);
+  });
+  $("watch-list").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-w]");
+    const row = e.target.closest("[data-i]");
+    if (!b || !row) return;
+    const i = Number(row.dataset.i);
+    const list = (view.settings.watched || []).map((w) => Object.assign({}, w));
+    if (b.dataset.w === "remove") list.splice(i, 1);
+    if (b.dataset.w === "on") list[i].on = !list[i].on;
+    setWatched(list);
+  });
+  $("watch-add").addEventListener("click", async () => {
+    const path = await invoke("choose_folder").catch(() => null);
+    if (path) addWatch(path);
+  });
+}
+
 // ---------- start ----------
 
 async function load() {
@@ -1113,6 +1206,7 @@ async function load() {
 if (tauri) {
   tauri.event.listen("settings-changed", load);
   tauri.event.listen("settings-page", (e) => setPage(e.payload));
+  tauri.event.listen("watch-add", () => { if (view) takePendingWatch(); });
   tauri.event.listen("converter-progress", (e) => {
     const p = e.payload;
     progress[p.id] = p;
@@ -1130,6 +1224,7 @@ if (tauri) {
 page = (location.hash || "#general").slice(1);
 if (!NAV.some((n) => n.id === page)) page = "general";
 load().then(() => setPage(page));
+
 
 // ---------- in a plain browser: sample data, for checking the design ----------
 
@@ -1176,6 +1271,8 @@ function demoInvoke(cmd, args) {
     case "converters_check": return Promise.resolve(["ffmpeg"]);
     case "converters_remove": d.tools.forEach((t) => { if (t.state === "ready") { t.state = "missing"; t.sizeMb = 0; } }); return Promise.resolve(163);
     case "choose_folder": return Promise.resolve("D:\\Converted");
+    case "watch_actions": return Promise.resolve([["folder.compress", "Compress"], ["folder.to:image.webp", "Pictures → WEBP"], ["folder.gps", "Remove GPS"]]);
+    case "watch_take_pending": return Promise.resolve(null);
     case "tune_info": {
       const dv = (g) => ({
         image: { look: [70, 80, 87][g], floor: 40, png: g === 2 ? 2 : 1, stripGps: false },

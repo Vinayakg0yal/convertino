@@ -114,15 +114,16 @@ pub struct FileInfo {
     pub size: u64,
 }
 
-#[derive(Serialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Clone, PartialEq, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SlotKind {
+    #[default]
     Target,
     More,
     Back,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Slot {
     pub id: String,
@@ -135,6 +136,15 @@ pub struct Slot {
     pub kind: SlotKind,
     /// How many selected files this slot applies to.
     pub count: usize,
+    /// Folder slots: the count under the label ("40 videos").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
+    /// Folder slots: a second line for the hint ("Leaves 2 files alone").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Folder slots: where the result goes ("→ new folder Clips (compressed)").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub out: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -166,6 +176,55 @@ pub struct WheelModel {
     /// Everything that was selected, folders and unknown files too (what Ask Claude sends).
     #[serde(skip)]
     pub selected: Vec<String>,
+    /// A folder's wheel (see folder.rs): what's in it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder: Option<FolderView>,
+    /// The folder as scanned, for the pick.
+    #[serde(skip)]
+    pub scan: Option<std::sync::Arc<crate::folder::Scan>>,
+}
+
+/// What the folder wheel shows about the folder.
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderView {
+    pub name: String,
+    pub roots: Vec<String>,
+    /// Visible files (with subfolders), and how many of them are in subfolders.
+    pub files: usize,
+    pub in_subfolders: usize,
+    pub subfolders: usize,
+    pub bytes: u64,
+    /// Hidden, system and other files left out, in words ("2 hidden, 1 shortcut").
+    pub alone: usize,
+    pub alone_words: String,
+    /// Results of earlier runs (left alone; Zip and Fit to size take them).
+    pub earlier: usize,
+    /// Opened from empty space inside the folder.
+    pub blank: bool,
+    /// More than folder::MAX_FILES: only that many were read.
+    pub truncated: bool,
+    /// Still reading the folder: files found so far.
+    pub scanning: Option<usize>,
+    /// "Use these every time" choices from Settings.
+    pub defaults: crate::folder::Defaults,
+    /// An image sequence: the first and last frame's names, frames, missing frames, size.
+    pub sequence: Option<SequenceView>,
+    /// The audio file a sequence can use as its sound.
+    pub sound: Option<String>,
+    /// How many files each slot touches without subfolders (slot id -> count).
+    pub top_counts: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SequenceView {
+    pub first: String,
+    pub last: String,
+    pub frames: usize,
+    pub gaps: usize,
+    pub width: u32,
+    pub height: u32,
 }
 
 fn human_size(bytes: u64) -> String {
@@ -210,6 +269,7 @@ fn slot(t: &Target, fam: &Family, count: usize, tag: bool, q: &Quality) -> Slot 
         tag: tag.then(|| fam.label.clone()),
         kind: SlotKind::Target,
         count,
+        ..Slot::default()
     }
 }
 
@@ -330,6 +390,7 @@ fn build_with(paths: &[String], accent: Option<String>, prefs: &Settings) -> Res
                 tag: None,
                 kind: SlotKind::More,
                 count: fs.len(),
+                ..Slot::default()
             });
             more.push(Slot {
                 id: "back".into(),
@@ -340,6 +401,7 @@ fn build_with(paths: &[String], accent: Option<String>, prefs: &Settings) -> Res
                 tag: None,
                 kind: SlotKind::Back,
                 count: fs.len(),
+                ..Slot::default()
             });
         }
         (main, more)
@@ -391,7 +453,168 @@ fn build_with(paths: &[String], accent: Option<String>, prefs: &Settings) -> Res
         pending_dialog: None,
         ask: None,
         selected: paths.to_vec(),
+        folder: None,
+        scan: None,
     })
+}
+
+/// The wheel for a folder (or several), from its scan.
+pub fn build_folder(scan: std::sync::Arc<crate::folder::Scan>, accent: Option<String>, blank: bool) -> Result<WheelModel, String> {
+    build_folder_with(scan, accent, blank, &crate::settings::get())
+}
+
+fn build_folder_with(scan: std::sync::Arc<crate::folder::Scan>, accent: Option<String>, blank: bool, prefs: &Settings) -> Result<WheelModel, String> {
+    use crate::folder;
+    let d = prefs.folder;
+    let name = scan.name();
+    if scan.items.is_empty() {
+        let hidden = if scan.alone.is_empty() { String::new() } else { format!(" (only {}: {})", if scan.alone.len() == 1 { "1 file that's left alone" } else { "files that are left alone" }, scan.alone_words()) };
+        return Err(format!("{name} is empty{hidden}."));
+    }
+    let (main, more) = folder::slots(&scan, &d, prefs);
+    // Counts without subfolders, for Shift+click's "Include subfolders".
+    let top = folder::Defaults { subfolders: false, ..d };
+    let mut top_counts = std::collections::BTreeMap::new();
+    for (a, p) in folder::candidates(&scan, &top, prefs) {
+        top_counts.insert(a.id(), p.files.len());
+    }
+    let top_files = scan.files(false).len();
+    top_counts.insert(folder::Action::Zip.id(), top_files);
+    top_counts.insert(folder::Action::Fit.id(), top_files);
+    let files = scan.files(true);
+    let seq = folder::find_sequence(&files).map(|s| SequenceView {
+        first: s.frames.first().map(|(_, p)| file_name_of(p)).unwrap_or_default(),
+        last: s.frames.last().map(|(_, p)| file_name_of(p)).unwrap_or_default(),
+        frames: s.frames.len(),
+        gaps: s.gaps.len(),
+        width: s.width,
+        height: s.height,
+    });
+    let bytes = scan.bytes();
+    let view = FolderView {
+        name: name.clone(),
+        roots: scan.roots.iter().map(|r| r.to_string_lossy().into_owned()).collect(),
+        files: files.len(),
+        in_subfolders: files.iter().filter(|i| i.in_subfolder()).count(),
+        subfolders: scan.subfolders,
+        bytes,
+        alone: scan.alone.len() + scan.skipped_dirs.iter().filter(|(_, w)| *w != crate::folder::Alone::Earlier).count(),
+        earlier: scan.earlier(),
+        alone_words: scan.alone_words(),
+        blank,
+        truncated: scan.truncated,
+        scanning: None,
+        defaults: d,
+        sequence: seq,
+        sound: files.iter().find(|i| i.family.as_deref() == Some("audio")).map(|i| file_name_of(&i.path)),
+        top_counts,
+    };
+    let n = files.len();
+    Ok(WheelModel {
+        os: if cfg!(target_os = "macos") { "mac" } else { "win" },
+        accent,
+        files: Vec::new(),
+        skipped: vec![name.clone()],
+        hub_title: name,
+        hub_subtitle: format!("{} · {}", if n == 1 { "1 file".to_string() } else { format!("{n} files") }, human_size(bytes)),
+        hub_family: "folder".into(),
+        hub_color: "#E8B84A".into(),
+        main,
+        more,
+        ring: prefs.progress_ring,
+        handoff_ms: prefs.handoff_seconds as u64 * 1000,
+        quality: prefs.quality.clone(),
+        presets: crate::tune::resolved_json(&prefs.quality.tune),
+        pending_dialog: None,
+        ask: None,
+        selected: scan.roots.iter().map(|r| r.to_string_lossy().into_owned()).collect(),
+        folder: Some(view),
+        scan: Some(scan),
+    })
+}
+
+/// The wheel while a big folder is still being read: no slots yet.
+pub fn scanning_folder(roots: &[std::path::PathBuf], found: usize, accent: Option<String>, blank: bool) -> WheelModel {
+    let prefs = crate::settings::get();
+    let name = match roots {
+        [one] => crate::folder::folder_name(one),
+        many => format!("{} folders", many.len()),
+    };
+    WheelModel {
+        os: if cfg!(target_os = "macos") { "mac" } else { "win" },
+        accent,
+        files: Vec::new(),
+        skipped: vec![name.clone()],
+        hub_title: name.clone(),
+        hub_subtitle: format!("Reading… {found} files"),
+        hub_family: "folder".into(),
+        hub_color: "#E8B84A".into(),
+        main: Vec::new(),
+        more: Vec::new(),
+        ring: prefs.progress_ring,
+        handoff_ms: prefs.handoff_seconds as u64 * 1000,
+        quality: prefs.quality.clone(),
+        presets: crate::tune::resolved_json(&prefs.quality.tune),
+        pending_dialog: None,
+        ask: None,
+        selected: roots.iter().map(|r| r.to_string_lossy().into_owned()).collect(),
+        folder: Some(FolderView { name, roots: roots.iter().map(|r| r.to_string_lossy().into_owned()).collect(), blank, scanning: Some(found), defaults: prefs.folder, ..FolderView::default() }),
+        scan: None,
+    }
+}
+
+fn file_name_of(p: &std::path::Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+fn all_targets() -> impl Iterator<Item = (&'static Family, &'static Target)> {
+    registry().families.iter().flat_map(|f| f.targets.iter().chain(f.more.iter()).map(move |t| (f, t)))
+}
+
+/// A known target id ("video.mp4").
+pub fn is_target(id: &str) -> bool {
+    all_targets().any(|(_, t)| t.id == id)
+}
+
+/// The kind of file a target belongs to ("video").
+pub fn target_family(id: &str) -> Option<String> {
+    all_targets().find(|(_, t)| t.id == id).map(|(f, _)| f.id.clone())
+}
+
+/// A target's label on the wheel ("MP4").
+pub fn target_label(id: &str) -> Option<String> {
+    all_targets().find(|(_, t)| t.id == id).map(|(_, t)| t.label.clone())
+}
+
+/// A target's output extension ("mp4"), for format conversions.
+pub fn target_ext(id: &str) -> Option<String> {
+    all_targets().find(|(_, t)| t.id == id).and_then(|(_, t)| if t.action { None } else { t.ext.clone() })
+}
+
+/// The same format, whatever the spelling ("jpeg" and "jpg").
+pub fn same_format(a: &str, b: &str) -> bool {
+    canonical(&a.to_lowercase()) == canonical(&b.to_lowercase())
+}
+
+/// A target's icon name.
+pub fn target_icon(id: &str) -> &'static str {
+    all_targets().find(|(_, t)| t.id == id).map(|(_, t)| t.icon.as_str()).unwrap_or("doc")
+}
+
+/// A family's format conversions (not actions, not editors) in the order Settings gives them.
+pub fn format_targets(family: &str, prefs: &Settings) -> Vec<(String, String)> {
+    let Some(fam) = registry().families.iter().find(|f| f.id == family) else { return Vec::new() };
+    let plain = Settings { learn: false, ..prefs.clone() };
+    arranged(fam, &plain)
+        .into_iter()
+        .filter(|t| !t.action && t.ext.is_some() && !opens_window(&t.id))
+        .map(|t| (t.id.clone(), t.label.clone()))
+        .collect()
+}
+
+/// "About 245 kbps" for an MP3 setting.
+pub fn mp3_words(kbps: u32) -> String {
+    live_hint("audio.mp3", "320 kbps", &Quality { mp3: kbps, ..Quality::default() })
 }
 
 /// Every kind of file with all its targets in the current order, for the

@@ -412,3 +412,38 @@ fn raw_photos_convert_with_their_details() {
     assert!(out.ends_with(".jpg"), "{out}");
     assert!(is_jpeg(Path::new(out)));
 }
+
+#[test]
+fn folders_zip_merge_and_convert_all() {
+    let s = Sandbox::new("folders");
+    let f = s.dir.join("Holiday");
+    std::fs::create_dir_all(f.join("day 2")).unwrap();
+    std::fs::copy(Path::new(FIXTURES).join("page.pdf"), f.join("a.pdf")).unwrap();
+    std::fs::copy(Path::new(FIXTURES).join("page.pdf"), f.join("day 2").join("b.pdf")).unwrap();
+    std::fs::copy(Path::new(FIXTURES).join("people.csv"), f.join("people.csv")).unwrap();
+    std::fs::write(f.join(".hidden"), "x").unwrap();
+    // A folder mixed with files is a usage mistake.
+    let out = s.run(&["Holiday", "people.csv", "--to", "zip"]);
+    assert_eq!(out.status.code(), Some(2));
+    // Zip: the visible files under the folder's name, next to it.
+    let (code, v) = s.json(&["Holiday", "--to", "zip"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(s.dir.join("Holiday.zip").is_file(), "{v}");
+    let files = v["files"].as_array().unwrap();
+    assert!(files.iter().any(|r| r["name"] == ".hidden" && r["kind"] == "alone"), "{v}");
+    // Merge the PDFs in name order (a.pdf, then day 2/b.pdf).
+    let (code, v) = s.json(&["Holiday", "--to", "merge-pdf"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(s.dir.join("Holiday.pdf").is_file());
+    assert_eq!(v["outputs"][0]["sources"].as_array().unwrap().len(), 2);
+    // Every CSV to JSON, in a new folder next to it with the same subfolders.
+    let (code, v) = s.json(&["Holiday", "--to", "json", "--no-subfolders"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(s.dir.join("Holiday (json)").join("people.json").is_file(), "{v}");
+    // Again: done before, nothing to do (exit 0, a note).
+    let (code, v) = s.json(&["Holiday", "--to", "json"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(v["outputs"].as_array().unwrap().is_empty());
+    let plain = text(&s.run(&["Holiday", "--to", "frobnicate"]).stderr);
+    assert!(plain.contains("compress"), "{plain}");
+}

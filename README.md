@@ -12,6 +12,7 @@ the original. Everything runs offline, on Windows and macOS.
 |---|---|---|
 | **Default: Alt+right-click** | Hold **Alt** and right-click a file in File Explorer or on the desktop | Hold **⌥ Option** (the Alt key) and right-click a file in Finder |
 | Keyboard shortcut (optional) | Select files, press **Ctrl+Alt+C** | Select files, press **⌃⌥C** |
+| **A whole folder** | Alt+right-click a folder, or empty space inside one | ⌥ Option+right-click a folder, or empty space in a Finder window |
 
 Alt+right-click is the easiest way and works right after you install (on a Mac,
 after allowing Accessibility once): nothing to set up,
@@ -35,6 +36,33 @@ keyboard, the shortcut is there too; change it to anything you like in
 
 A progress ring shows at the pointer, and every conversion can be undone. Shift+click a
 format on the wheel to set options for that one conversion.
+
+## Folders
+
+Alt+right-click a folder (or empty space inside it) and the wheel offers what fits
+what's in it:
+
+- **Compress all** (pictures, videos, PDFs and audio, each the smallest that still looks
+  the same), **All → MP4 / JPG / MP3 / …** for each kind of file found (only the files
+  that need it), **Audio only** (MP3 from every video), **Normalize all**, **Remove GPS**.
+- **Join clips** into one video (without re-encoding when every clip matches, otherwise
+  matched to the first), **Join audio**, **Photos → PDF**, **Merge PDFs**, **One
+  spreadsheet** (a sheet per CSV file), all in name order (2 before 10).
+- **Sequence → video / GIF**: numbered frames (`render_0001.png …`) into MP4, H.265,
+  ProRes, WebM (keeps transparency) or GIF; a missing frame holds the one before it.
+- **Extract all** archives, **Zip** the folder (ZIP, 7Z or TAR.GZ, a password, pieces),
+  and **Fit to size**: a compressed copy of the folder, one zip, or an untouched zip in
+  pieces, that fits the size you pick.
+- **Watch this folder…**: new files there are converted on their own (Settings ›
+  Watched folders), for example OBS recordings compressed once recording ends.
+
+Results go in a new folder next to it (`Clips (compressed)`, same subfolders inside), or
+Shift+click for next to each original or replacing the originals (they move to a
+"Convertino originals" folder next to it once the new copy checks out; Undo puts them
+back, and you delete that folder when you're happy). Files done in an earlier run are
+skipped. Hidden and system files are left alone, and every file is accounted for: the
+corner card's **Details** lists each one and what happened to it. **Stop after this
+file** finishes the file in progress; **Carry on** does the rest later.
 
 ## PDF editor
 
@@ -82,6 +110,8 @@ convertino a.jpg b.jpg --size 5MB --together
 convertino report.docx --to pdf --out D:\Converted
 convertino formats photo.CR3               what a file can become
 convertino tools                           which converters are ready (tools install --all to fetch them now)
+convertino "E:\Videos\Clips" --to compress   everything in a folder (also zip, join, merge-pdf, sequence, mp4, …)
+convertino "E:\Videos\Clips" --size 4GB --as zip
 ```
 
 Options: `--quality small|balanced|best` (as tuned in Settings), one-off preset changes
@@ -91,6 +121,11 @@ with `--look 91`, `--encoder gpu|cpu|auto`, `--max-res 1080`, `--max-fps 60` or
 `--quiet`. Results go next to the originals (or `--out`); originals are never changed
 and existing files are never overwritten. Exit codes: 0 done, 1 some files failed,
 2 the command was wrong, 130 cancelled with Ctrl+C.
+
+Folders take `--into new|beside|replace`, `--no-subfolders`, `--redo-done`,
+`--as folder|zip|parts` (with `--size`), `--order name|date`, `--fps`, `--format
+mp4|h265|prores|webm|gif`, `--sound`, `--stop-at-gaps`, `--password` and `--parts`
+(see `convertino --help`); `--json` lists every file and what happened to it.
 
 ## AI apps (MCP)
 

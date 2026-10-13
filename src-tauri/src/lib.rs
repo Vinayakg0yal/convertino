@@ -19,6 +19,7 @@ mod connect;
 mod convert;
 mod data;
 mod engine;
+mod folder;
 mod image_edit;
 mod install;
 mod jobs;
@@ -43,6 +44,7 @@ mod mac;
 use mac as alt_click;
 mod selection;
 mod video;
+mod watch;
 mod wheel;
 #[cfg(test)]
 mod smoke;
@@ -105,6 +107,10 @@ struct AppState {
     /// The window that was in front before the wheel opened (Windows), to give focus back.
     #[cfg_attr(not(windows), allow(dead_code))]
     previous_foreground: Mutex<Option<isize>>,
+    /// A folder being read for the wheel: set to stop it (the wheel was closed).
+    scan_cancel: Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+    /// Fit to size: the folder's files as measured, per wheel.
+    fit_data: Mutex<Option<(u64, std::sync::Arc<folder::FitData>)>>,
 }
 
 /// How the ring is laid out in its window.
@@ -559,7 +565,217 @@ pub(crate) fn show_hud(app: &AppHandle) {
 
 #[tauri::command]
 fn wheel_close(app: AppHandle) {
+    stop_scan(&app);
     hide_wheel(&app);
+}
+
+// ---------- folders (see folder.rs) ----------
+
+/// The open folder wheel's scan.
+fn wheel_scan(app: &AppHandle) -> Result<std::sync::Arc<folder::Scan>, String> {
+    app.state::<AppState>().wheel.lock().ok().and_then(|w| w.as_ref().and_then(|m| m.scan.clone())).ok_or_else(|| "The folder wheel was closed.".to_string())
+}
+
+/// A folder slot was picked. `opts`: Shift+click's choices (where results go,
+/// subfolders, …); `remember`: keep them in Settings.
+#[tauri::command]
+fn folder_pick(app: AppHandle, state: tauri::State<'_, AppState>, action_id: String, label: String, opts: folder::Opts, quality: Option<settings::Quality>, remember: Option<bool>) -> Result<u64, String> {
+    let action = folder::Action::from_id(&action_id).ok_or("Unknown folder action")?;
+    let scan = wheel_scan(&app)?;
+    settings::record_pick(&action_id);
+    if action == folder::Action::Watch {
+        hide_wheel(&app);
+        if let Some(root) = scan.roots.first() {
+            watch::set_pending(root.to_string_lossy().into_owned());
+        }
+        show_settings(&app, Some("watch"));
+        let _ = app.emit_to("settings", "watch-add", ());
+        return Ok(0);
+    }
+    if remember == Some(true) {
+        let d = opts.defaults();
+        settings::update(|s| {
+            s.folder = d;
+            if let Some(q) = &quality {
+                s.quality = q.clone();
+            }
+        });
+        settings_changed(&app);
+    }
+    log::info!("folder pick {action_id} ({label}) for {}", scan.name());
+    let ring = settings::get().progress_ring;
+    if !ring {
+        hide_wheel(&app);
+    }
+    let q = quality.map(|q| q.clamped());
+    let id = jobs::start_folder_planned(app.clone(), scan, action, opts, q, label, ring);
+    if ring {
+        if let Ok(mut r) = state.ring.lock() {
+            *r = Some(id);
+        }
+    }
+    Ok(id)
+}
+
+/// What the folder's size ring offers ("Fit to size"). Measuring the files takes a moment.
+#[tauri::command]
+async fn folder_fit_presets(app: AppHandle, mode: folder::FitMode, subfolders: bool) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let data = fit_data(&app, subfolders)?;
+        let scan = wheel_scan(&app)?;
+        Ok(serde_json::json!({
+            "title": scan.name(),
+            "count": data.files,
+            "total": data.total,
+            "presets": folder::fit_presets(&data, mode),
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// What a typed size would do to the folder.
+#[tauri::command]
+async fn folder_fit_preview(app: AppHandle, bytes: u64, mode: folder::FitMode, subfolders: bool) -> Result<size::Preview, String> {
+    tauri::async_runtime::spawn_blocking(move || Ok(folder::fit_preview(fit_data(&app, subfolders)?.as_ref(), bytes, mode))).await.map_err(|e| e.to_string())?
+}
+
+fn fit_data(app: &AppHandle, subfolders: bool) -> Result<std::sync::Arc<folder::FitData>, String> {
+    let scan = wheel_scan(app)?;
+    let key = std::sync::Arc::as_ptr(&scan) as u64 ^ subfolders as u64;
+    if let Some((k, d)) = app.state::<AppState>().fit_data.lock().ok().and_then(|f| f.clone()) {
+        if k == key {
+            return Ok(d);
+        }
+    }
+    let files = scan.files(subfolders);
+    let a = app.clone();
+    let data = std::sync::Arc::new(folder::fit_measure(&files, false, &move |done, total| {
+        let _ = a.emit_to("wheel", "fit-measure", serde_json::json!({ "done": done, "total": total }));
+    })?);
+    if let Ok(mut f) = app.state::<AppState>().fit_data.lock() {
+        *f = Some((key, data.clone()));
+    }
+    Ok(data)
+}
+
+/// Join clips: whether they join without re-encoding (the hint says before you click).
+#[tauri::command]
+async fn folder_join_check(app: AppHandle, subfolders: bool) -> Result<folder::JoinCheck, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let scan = wheel_scan(&app)?;
+        let mut clips: Vec<&folder::Item> = scan.files(subfolders).into_iter().filter(|i| i.family.as_deref() == Some("video")).collect();
+        clips.sort_by(|a, b| a.root.cmp(&b.root).then_with(|| folder::natural_cmp(&a.rel.to_string_lossy(), &b.rel.to_string_lossy())));
+        let paths: Vec<PathBuf> = clips.iter().map(|i| i.path.clone()).collect();
+        folder::join_check(&paths)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// "Stop after this file" on a folder job's card.
+#[tauri::command]
+fn job_stop_after(id: u64) {
+    jobs::stop_after(id);
+}
+
+/// "Carry on" on a stopped folder job: the rest, as a new job.
+#[tauri::command]
+fn folder_resume(app: AppHandle, id: u64) -> Result<u64, String> {
+    jobs::resume(app, id)
+}
+
+/// A folder added from the wheel's "Watch this folder…", for Settings to show.
+#[tauri::command]
+fn watch_take_pending() -> Option<String> {
+    watch::take_pending()
+}
+
+/// What a watched folder can do with each new file.
+#[tauri::command]
+fn watch_actions() -> Vec<(String, String)> {
+    watch::ACTIONS.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+}
+
+fn stop_scan(app: &AppHandle) {
+    if let Some(c) = app.state::<AppState>().scan_cancel.lock().ok().and_then(|mut c| c.take()) {
+        c.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Reads the folders, then opens the folder wheel. A big folder opens the
+/// wheel at once ("Reading… 1,240 files") and fills it in when it's done.
+fn open_for_folders(app: &AppHandle, roots: Vec<PathBuf>, blank: bool, cursor: Option<PhysicalPosition<f64>>, started: Instant, trigger: &str) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Arc;
+    stop_scan(app);
+    let cancel = Arc::new(AtomicBool::new(false));
+    if let Ok(mut c) = app.state::<AppState>().scan_cancel.lock() {
+        *c = Some(cancel.clone());
+    }
+    let found = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let (roots, cancel, found) = (roots.clone(), cancel.clone(), found.clone());
+        std::thread::spawn(move || {
+            let r = folder::scan(&roots, &cancel, &|n| found.store(n, Ordering::SeqCst));
+            let _ = tx.send(r);
+        });
+    }
+    let accent = accent::system_accent();
+    let finish = |app: &AppHandle, r: Result<folder::Scan, String>, update: bool| {
+        let model = r.and_then(|s| wheel::build_folder(Arc::new(s), accent.clone(), blank));
+        match model {
+            Ok(mut m) => {
+                m.ask = ask::for_wheel(&settings::get(), ask::connected());
+                if let Ok(mut f) = app.state::<AppState>().fit_data.lock() {
+                    *f = None;
+                }
+                log::info!("{trigger}: folder wheel for {} ({} files) in {} ms", m.hub_title, m.folder.as_ref().map(|f| f.files).unwrap_or(0), started.elapsed().as_millis());
+                if update {
+                    if let Ok(mut w) = app.state::<AppState>().wheel.lock() {
+                        *w = Some(m.clone());
+                    }
+                    let _ = app.emit_to("wheel", "wheel-update", m);
+                } else {
+                    let app2 = app.clone();
+                    let _ = app.run_on_main_thread(move || open_wheel(&app2, m, cursor));
+                }
+            }
+            Err(msg) => {
+                log::info!("{trigger}: folder: {msg}");
+                if update {
+                    hide_wheel(app);
+                }
+                report_error(app, msg, started.elapsed().as_millis());
+            }
+        }
+    };
+    match rx.recv_timeout(std::time::Duration::from_millis(350)) {
+        Ok(r) => finish(app, r, false),
+        Err(_) => {
+            let m = wheel::scanning_folder(&roots, found.load(Ordering::SeqCst), accent.clone(), blank);
+            let app2 = app.clone();
+            let _ = app.run_on_main_thread(move || open_wheel(&app2, m, cursor));
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                    Ok(r) => {
+                        if cancel.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        return finish(app, r, true);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if cancel.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let _ = app.emit_to("wheel", "wheel-scan", found.load(Ordering::SeqCst));
+                    }
+                    Err(_) => return,
+                }
+            }
+        }
+    }
 }
 
 // ---------- Settings ----------
@@ -1237,12 +1453,22 @@ fn on_hotkey(app: &AppHandle) {
 #[cfg(windows)]
 fn on_alt_click(app: &AppHandle, x: i32, y: i32, root: isize) {
     let started = Instant::now();
-    match selection::select_item_at(x, y) {
-        Ok(true) => {}
-        Ok(false) => log::info!("alt-click: no file under the pointer, using the current selection"),
-        Err(e) => log::warn!("alt-click: couldn't select the file under the pointer: {e}"),
-    }
-    let selection = selection::selection_for(Some(root));
+    let selection = match selection::select_item_at(x, y) {
+        Ok(selection::Under::Item) => selection::selection_for(Some(root)),
+        // Empty space among the files: the folder itself, like a normal right-click there.
+        Ok(selection::Under::Blank) => {
+            log::info!("alt-click: empty space, using the folder");
+            selection::folder_for(Some(root))
+        }
+        Ok(selection::Under::Other) => {
+            log::info!("alt-click: no file under the pointer, using the current selection");
+            selection::selection_for(Some(root))
+        }
+        Err(e) => {
+            log::warn!("alt-click: couldn't select the file under the pointer: {e}");
+            selection::selection_for(Some(root))
+        }
+    };
     open_for_selection(app, selection, started, Some(PhysicalPosition::new(x as f64, y as f64)), "alt-click");
 }
 
@@ -1256,10 +1482,17 @@ fn on_option_click(app: &AppHandle, x: f64, y: f64) {
     let selection = match (selection, under) {
         (Ok(sel), Some(item)) if sel.paths.iter().any(|p| p.trim_end_matches('/') == item.trim_end_matches('/')) => Ok(sel),
         (_, Some(item)) => Ok(selection::Selection { source: "Finder".into(), paths: vec![item], ..Default::default() }),
-        (sel, None) => {
-            log::info!("option-click: no item found under the pointer; using Finder's selection");
-            sel
-        }
+        (sel, None) => match mac::folder_at(x, y) {
+            // Empty space in a Finder window (or the desktop): that folder.
+            Some(dir) => {
+                log::info!("option-click: empty space in {}", dir.display());
+                Ok(selection::Selection { source: "Finder".into(), paths: vec![dir.to_string_lossy().into_owned()], blank: true, ..Default::default() })
+            }
+            None => {
+                log::info!("option-click: no item found under the pointer; using Finder's selection");
+                sel
+            }
+        },
     };
     let cursor = app.cursor_position().ok();
     open_for_selection(app, selection, started, cursor, "option-click");
@@ -1331,9 +1564,11 @@ fn open_for_selection(
         let elapsed_ms = started.elapsed().as_millis();
 
         let pending_dialog;
+        let blank;
         let paths = match selection {
             Ok(sel) => {
                 pending_dialog = sel.pending_dialog;
+                blank = sel.blank;
                 log::info!("{trigger}: {} item(s) from {} in {elapsed_ms} ms", sel.paths.len(), sel.source);
                 for p in &sel.paths {
                     log::info!("  {p}");
@@ -1358,6 +1593,11 @@ fn open_for_selection(
             }
         };
 
+        // One or more folders (and nothing else): the folder wheel.
+        if !paths.is_empty() && pending_dialog.is_none() && paths.iter().all(|p| std::path::Path::new(p).is_dir()) {
+            let roots: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+            return open_for_folders(&app, roots, blank, cursor, started, trigger);
+        }
         match wheel::build(&paths, accent::system_accent()) {
             Ok(mut model) => {
                 if pending_dialog.is_some() {
@@ -1505,6 +1745,14 @@ pub fn run() {
             converters_check,
             wheel_model,
             wheel_pick,
+            folder_pick,
+            folder_fit_presets,
+            folder_fit_preview,
+            folder_join_check,
+            job_stop_after,
+            folder_resume,
+            watch_take_pending,
+            watch_actions,
             wheel_close,
             compress_presets,
             tune_info,
@@ -1633,6 +1881,7 @@ pub fn run() {
                 }
             }
             update::start_background_checks(app.handle());
+            watch::start(app.handle().clone());
             log::info!("Convertino started");
             Ok(())
         })

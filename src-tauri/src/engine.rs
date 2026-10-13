@@ -28,6 +28,8 @@ pub enum Event {
     Progress { fraction: f64, detail: String },
     /// A converter is being downloaded for this job.
     Download { fraction: f64, detail: String },
+    /// A step started (folder jobs show the file's name).
+    StepStarted { index: usize, input: PathBuf },
     /// One step finished (in any order when several run at once).
     StepDone {
         #[allow(dead_code)]
@@ -115,6 +117,16 @@ pub fn parallel_for(steps: &[convert::Step]) -> usize {
 /// Runs the steps of job `id` (several at once when they allow it) and
 /// reports to `sink`. Cancel with `procs::cancel(id)`.
 pub fn run_steps(id: u64, steps: &[convert::Step], out_dir: Option<&Path>, sink: &Sink) -> Outcome {
+    run_steps_where(id, steps, out_dir, false, sink)
+}
+
+/// The same, saving each result in its step's own folder exactly (a folder
+/// job's mirror of the original folder), whatever Settings says.
+pub fn run_steps_exact(id: u64, steps: &[convert::Step], sink: &Sink) -> Outcome {
+    run_steps_where(id, steps, None, true, sink)
+}
+
+fn run_steps_where(id: u64, steps: &[convert::Step], out_dir: Option<&Path>, exact: bool, sink: &Sink) -> Outcome {
     let total = steps.len();
     let workers = parallel_for(steps);
     let next = AtomicU64::new(0);
@@ -143,6 +155,7 @@ pub fn run_steps(id: u64, steps: &[convert::Step], out_dir: Option<&Path>, sink:
     let setup_thread = || {
         crate::procs::set_current_job(id);
         convert::set_out_override(out_dir.map(Path::to_path_buf));
+        convert::set_exact_dirs(exact);
         let s = sink.clone();
         let last = std::cell::Cell::new(Instant::now() - Duration::from_secs(1));
         crate::install::set_reporter(move |fraction, detail| {
@@ -155,12 +168,14 @@ pub fn run_steps(id: u64, steps: &[convert::Step], out_dir: Option<&Path>, sink:
         });
     };
     let work = || loop {
-        if crate::procs::is_cancelled(id) {
+        // Cancelled, or "Stop after this file": no new file starts.
+        if crate::procs::is_stopping(id) {
             break;
         }
         let i = next.fetch_add(1, Ordering::SeqCst) as usize;
         let Some(step) = steps.get(i) else { break };
         log::info!("job {id}: {} ({} input(s))", step.inputs[0].display(), step.inputs.len());
+        sink(Event::StepStarted { index: i, input: step.inputs[0].clone() });
         report_all(i, 0.0);
         let started = Instant::now();
         let r = convert::run(step, &mut |p| report_all(i, p));
@@ -178,6 +193,7 @@ pub fn run_steps(id: u64, steps: &[convert::Step], out_dir: Option<&Path>, sink:
         setup_thread();
         work();
         convert::set_out_override(None);
+        convert::set_exact_dirs(false);
     } else {
         std::thread::scope(|scope| {
             for _ in 0..workers {

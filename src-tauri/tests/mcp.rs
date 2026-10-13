@@ -254,3 +254,26 @@ fn closing_the_connection_ends_the_server() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[test]
+fn folders_list_and_convert() {
+    let mut m = Mcp::start("folders", None);
+    let f = m.dir.join("Scans");
+    std::fs::create_dir_all(&f).unwrap();
+    for n in ["p 2.pdf", "p 10.pdf"] {
+        std::fs::copy(Path::new(FIXTURES).join("page.pdf"), f.join(n)).unwrap();
+    }
+    let r = m.call(2, "list_conversions", json!({ "paths": [f] }));
+    assert_eq!(r["isError"], false, "{r}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Merge PDFs") && text.contains("merge-pdf"), "{text}");
+    let r = m.call(3, "convert", json!({ "paths": [f], "to": "merge-pdf" }));
+    assert_eq!(r["isError"], false, "{r}");
+    let out = PathBuf::from(r["structuredContent"]["outputs"][0]["path"].as_str().unwrap());
+    assert_eq!(out, m.dir.join("Scans.pdf"));
+    // The sources are in name order: p 2 before p 10.
+    let sources: Vec<String> = r["structuredContent"]["outputs"][0]["sources"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect();
+    assert!(sources[0].ends_with("p 2.pdf"), "{sources:?}");
+    let r = m.call(4, "convert", json!({ "paths": [f], "to": "zip", "into": "sideways" }));
+    assert_eq!(r["isError"], true);
+}

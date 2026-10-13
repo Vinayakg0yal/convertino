@@ -43,7 +43,7 @@ pub fn convert(input: &Path, to: Format, output: &Path) -> Result<(), String> {
 }
 
 /// UTF-8 (with or without BOM), UTF-16 with BOM, or Windows-1252 as a last resort.
-fn decode(bytes: &[u8]) -> String {
+pub(crate) fn decode(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(b"\xEF\xBB\xBF") {
         return String::from_utf8_lossy(rest).into_owned();
     }
@@ -377,43 +377,65 @@ pub fn write(v: &Value, to: Format, output: &Path, sheet: &str) -> Result<(), St
 }
 
 fn write_xlsx(v: &Value, output: &Path, sheet: &str) -> Result<(), String> {
-    use rust_xlsxwriter::{Format as Style, Workbook};
-    let (headers, rows) = table(v);
-    let mut book = Workbook::new();
-    let ws = book.add_worksheet();
-    let name: String = sheet.chars().filter(|c| !"[]:*?/\\".contains(*c)).take(31).collect();
-    if !name.trim().is_empty() {
-        let _ = ws.set_name(name.trim());
+    write_sheets(&[(sheet.to_string(), v.clone())], output)
+}
+
+/// A sheet name Excel accepts: no []:*?/\, at most 31 characters, not used yet.
+fn sheet_name(wanted: &str, used: &mut Vec<String>) -> String {
+    let clean: String = wanted.chars().filter(|c| !"[]:*?/\\".contains(*c)).collect();
+    let clean = clean.trim().trim_matches('\'').to_string();
+    let base: String = if clean.is_empty() { format!("Sheet{}", used.len() + 1) } else { clean.chars().take(31).collect() };
+    let mut name = base.clone();
+    let mut n = 2;
+    while used.iter().any(|u| u.eq_ignore_ascii_case(&name)) {
+        let tail = format!(" ({n})");
+        name = format!("{}{tail}", base.chars().take(31 - tail.chars().count()).collect::<String>());
+        n += 1;
     }
+    used.push(name.clone());
+    name
+}
+
+/// One workbook with a sheet per (name, table), in order (a folder's CSV files as one spreadsheet).
+pub fn write_sheets(sheets: &[(String, Value)], output: &Path) -> Result<(), String> {
+    use rust_xlsxwriter::{Format as Style, Workbook};
+    let mut book = Workbook::new();
     let err = |e: rust_xlsxwriter::XlsxError| e.to_string();
     let bold = Style::new().set_bold();
-    for (c, h) in headers.iter().enumerate() {
-        ws.write_string_with_format(0, c as u16, h, &bold).map_err(err)?;
-    }
-    for (r, row) in rows.iter().enumerate() {
-        let r = (r + 1) as u32;
-        if r > 1_048_575 {
-            return Err("Excel sheets hold at most 1,048,576 rows; this file has more.".into());
+    let mut used = Vec::new();
+    for (sheet, v) in sheets {
+        let (headers, rows) = table(v);
+        let ws = book.add_worksheet();
+        let name = sheet_name(sheet, &mut used);
+        let _ = ws.set_name(&name);
+        for (c, h) in headers.iter().enumerate() {
+            ws.write_string_with_format(0, c as u16, h, &bold).map_err(err)?;
         }
-        for (c, cell) in row.iter().enumerate() {
-            let c = c as u16;
-            match cell {
-                Value::Null => {}
-                Value::Bool(b) => {
-                    ws.write_boolean(r, c, *b).map_err(err)?;
-                }
-                Value::Number(n) => {
-                    ws.write_number(r, c, n.as_f64().unwrap_or(0.0)).map_err(err)?;
-                }
-                other => {
-                    let text: String = cell_text(other).chars().take(32_767).collect();
-                    ws.write_string(r, c, text).map_err(err)?;
+        for (r, row) in rows.iter().enumerate() {
+            let r = (r + 1) as u32;
+            if r > 1_048_575 {
+                return Err(format!("Excel sheets hold at most 1,048,576 rows; {name} has more."));
+            }
+            for (c, cell) in row.iter().enumerate() {
+                let c = c as u16;
+                match cell {
+                    Value::Null => {}
+                    Value::Bool(b) => {
+                        ws.write_boolean(r, c, *b).map_err(err)?;
+                    }
+                    Value::Number(n) => {
+                        ws.write_number(r, c, n.as_f64().unwrap_or(0.0)).map_err(err)?;
+                    }
+                    other => {
+                        let text: String = cell_text(other).chars().take(32_767).collect();
+                        ws.write_string(r, c, text).map_err(err)?;
+                    }
                 }
             }
         }
+        ws.set_freeze_panes(1, 0).map_err(err)?;
+        ws.autofit();
     }
-    ws.set_freeze_panes(1, 0).map_err(err)?;
-    ws.autofit();
     book.save(output).map_err(err)
 }
 

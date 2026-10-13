@@ -141,6 +141,16 @@
       </div>
     </section>
 
+    <!-- ===== Watched folders ===== -->
+    <section data-page="watch" hidden>
+      <div class="tip">
+        <svg class="ic sm accent" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z M12 9a3 3 0 100 6 3 3 0 000-6z"/></svg>
+        <span>New files in these folders are converted on their own while Convertino runs (it starts at sign-in). A file is picked up once it has stopped growing, so a recording isn't touched while it's still being written. Files already there are left as they are; for those, Alt+right-click the folder.</span>
+      </div>
+      <div class="card list" id="watch-list" aria-label="Watched folders"></div>
+      <div class="buttons"><button type="button" class="btn" id="watch-add">Watch a folder…</button></div>
+    </section>
+
     <!-- ===== Converters ===== -->
     <section data-page="converters" hidden>
       <div class="tip"><span>Each converter downloads the first time a conversion needs it, so Convertino only takes the space you use. <span class="sub" id="used"></span></span></div>

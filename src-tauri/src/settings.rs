@@ -132,6 +132,10 @@ pub struct Settings {
     pub ask_claude: bool,
     /// Where Ask Claude opens: "chat" or "code" (see ask.rs; "cowork" from before 4 Oct 2026 becomes "chat").
     pub ask_mode: String,
+    /// Folder jobs: where results go, subfolders, skipping files done before ("Use these every time").
+    pub folder: crate::folder::Defaults,
+    /// Watched folders: new files in them are converted (see watch.rs).
+    pub watched: Vec<crate::watch::Watched>,
     /// Settings format. Files without it are from before version 2.
     #[serde(default)]
     pub version: u32,
@@ -160,6 +164,8 @@ impl Default for Settings {
             ai_card: true,
             ask_claude: true,
             ask_mode: "chat".into(),
+            folder: crate::folder::Defaults::default(),
+            watched: Vec::new(),
             version: VERSION,
         }
     }

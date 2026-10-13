@@ -11,6 +11,20 @@ pub struct Selection {
     /// A Save dialog (its window handle) whose file doesn't exist yet: `paths`
     /// holds the name typed there, and the conversion runs once it's saved.
     pub pending_dialog: Option<isize>,
+    /// Empty space inside a folder was clicked: `paths` holds that folder.
+    pub blank: bool,
+}
+
+/// What was under the pointer at Alt+right-click.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Under {
+    /// A file or folder (now selected, like a right-click does).
+    Item,
+    /// Empty space among the files: the folder itself.
+    Blank,
+    /// Something else (the navigation pane, the ribbon).
+    Other,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -19,7 +33,7 @@ pub mod dialog;
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
-pub use win::{current_selection, select_item_at, selection_for, window_open};
+pub use win::{current_selection, folder_for, select_item_at, selection_for, window_open};
 
 #[cfg(target_os = "macos")]
 mod mac;

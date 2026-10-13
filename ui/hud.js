@@ -58,6 +58,7 @@ function head(via) {
 function started(job) {
   const c = card(job.id);
   c.via = job.via;
+  if (job.folder) return startedFolder(job, c);
   c.el.innerHTML =
     head(job.via) +
     `<div class="title" title="${esc(job.title)}">${esc(job.title)}</div>` +
@@ -73,6 +74,32 @@ function started(job) {
   fit();
 }
 
+// A folder job: the file in progress, what's been saved so far, and two ways to stop.
+function startedFolder(job, c) {
+  c.el.innerHTML =
+    head(job.via) +
+    `<div class="title" title="${esc(job.title)}">${esc(job.title)}</div>` +
+    `<div class="detail">Starting…</div>` +
+    `<div class="bar indeterminate"><i></i></div>` +
+    `<div class="extra" hidden></div>` +
+    `<div class="row stops"><button class="cancel" type="button" data-a="after">Stop after this file</button><button class="cancel" type="button" data-a="now">Stop now</button></div>`;
+  c.el.querySelector(".x").onclick = () => remove(job.id);
+  const after = c.el.querySelector('[data-a="after"]');
+  const now = c.el.querySelector('[data-a="now"]');
+  after.onclick = () => {
+    after.disabled = true;
+    after.textContent = "Stopping after this file…";
+    if (tauri) tauri.core.invoke("job_stop_after", { id: job.id }).catch(() => {});
+  };
+  now.onclick = () => {
+    after.disabled = true;
+    now.disabled = true;
+    now.textContent = "Stopping…";
+    if (tauri) tauri.core.invoke("job_cancel", { id: job.id }).catch(() => {});
+  };
+  fit();
+}
+
 function progress(p) {
   const c = cards.get(p.id);
   if (!c || c.done) return;
@@ -83,6 +110,22 @@ function progress(p) {
     bar.querySelector("i").style.width = `${(p.fraction * 100).toFixed(1)}%`;
   }
   c.el.querySelector(".detail").textContent = p.detail;
+  const extra = c.el.querySelector(".extra");
+  if (extra && p.extra) {
+    extra.hidden = false;
+    extra.textContent = p.extra;
+  }
+}
+
+const ROW_CLASS = { done: "ok", kept: "dim", failed: "bad", alone: "dim", doneBefore: "dim", notStarted: "dim" };
+
+/// Every file of a folder job and what happened to it.
+function detailsHtml(rows) {
+  // Problems first, then the rest in folder order.
+  const rank = { failed: 0, notStarted: 1, done: 2, kept: 3, doneBefore: 4, alone: 5 };
+  const sorted = rows.slice().sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9));
+  return `<div class="details" role="list">` + sorted.map((r) =>
+    `<div class="drow" role="listitem"><span class="f" title="${esc(r.name)}">${esc(r.name)}</span><span class="s ${ROW_CLASS[r.kind] || ""}" title="${esc(r.status)}">${esc(r.status)}</span></div>`).join("") + `</div>`;
 }
 
 function done(d) {
@@ -92,10 +135,12 @@ function done(d) {
   c.el.classList.toggle("bad", !d.ok);
   const fixLabel = { "windows-security": "Open Windows Security", "mac-privacy": "Open Privacy settings" }[d.fix];
   const buttons = [];
+  if (d.resume) buttons.push(`<button type="button" class="primary" data-a="resume">Carry on (${d.resume} left)</button>`);
   if (d.compare) buttons.push(`<button type="button" data-a="compare">Compare</button>`);
   if (d.ok && d.canUndo !== false) buttons.push(`<button type="button" data-a="open">${isMac ? "Show in Finder" : "Open folder"}</button>`, `<button type="button" data-a="undo">Undo</button>`);
   if (fixLabel) buttons.push(`<button type="button" data-a="fix">${fixLabel}</button>`);
   if (d.report) buttons.push(`<button type="button" data-a="report">Send report</button>`);
+  if (d.details && d.details.length) buttons.push(`<button type="button" data-a="details" aria-expanded="false">Details (${d.details.length})</button>`);
   c.el.innerHTML =
     head(via) +
     `<div class="title" title="${esc(d.title)}">${esc(d.title)}</div>` +
@@ -111,14 +156,37 @@ function done(d) {
     undo.disabled = true;
     try {
       await tauri.core.invoke("job_undo", { id: d.id });
-      c.el.querySelector(".title").textContent = isMac ? "Moved to the Trash" : "Moved to the Recycle Bin";
-      c.el.querySelector(".body").textContent = "The original files are untouched.";
+      c.el.querySelector(".title").textContent = d.replaced ? "Originals put back" : isMac ? "Moved to the Trash" : "Moved to the Recycle Bin";
+      c.el.querySelector(".body").textContent = d.replaced ? `The new files went to the ${isMac ? "Trash" : "Recycle Bin"}.` : "The original files are untouched.";
+      const list = c.el.querySelector(".details");
+      if (list) list.remove();
       c.el.querySelector(".buttons").remove();
       fit();
       schedule(d.id, 2000);
     } catch (e) {
       c.el.querySelector(".body").textContent = String(e);
       undo.disabled = false;
+    }
+  });
+  on("details", (b) => {
+    clearTimeout(c.timer);
+    const open = b.getAttribute("aria-expanded") === "true";
+    const list = c.el.querySelector(".details");
+    if (open && list) list.remove();
+    else c.el.insertAdjacentHTML("beforeend", detailsHtml(d.details));
+    b.setAttribute("aria-expanded", String(!open));
+    b.textContent = open ? `Details (${d.details.length})` : "Hide details";
+    fit();
+  });
+  on("resume", async (b) => {
+    b.disabled = true;
+    try {
+      await tauri.core.invoke("folder_resume", { id: d.id });
+      remove(d.id);
+    } catch (e) {
+      b.disabled = false;
+      c.el.querySelector(".body").textContent = String(e);
+      fit();
     }
   });
   on("fix", () => tauri.core.invoke("open_fix", { kind: d.fix }).catch(() => {}));
@@ -201,6 +269,18 @@ if (tauri) {
   // Opened in a browser: show sample cards for design checks.
   document.documentElement.style.background = "#6b7a8f";
   started({ id: 1, title: "voice-memo.wav → MP3" });
+  started({ id: 6, title: "Compress Valorant clips", folder: true });
+  progress({ id: 6, fraction: 0.29, detail: "File 13 of 44 · clip_0413.mp4", extra: "Saved so far: 2.9 GB on 12 files" });
+  done({ id: 7, ok: true, attention: true, canUndo: true, compare: true, title: "Compress Valorant clips · done, with failures",
+    body: "14.50 GB → 5.90 GB (41% of the original)\n42 compressed · 1 already small, kept · 1 failed · 2 left alone",
+    details: [
+      { name: "clip_0401.mp4", status: "1.20 GB → 410.0 MB", kind: "done" },
+      { name: "clip_0405.mp4", status: "This file seems to be damaged.", kind: "failed" },
+      { name: "thumb_01.jpg", status: "Already as small as it looks · kept", kind: "kept" },
+      { name: "desktop.ini", status: "Left alone · system file", kind: "alone" },
+      { name: "obs-scene.json", status: "Left alone · not something Compress works on", kind: "alone" },
+    ] });
+  done({ id: 8, ok: true, attention: true, canUndo: true, resume: 32, title: "Stopped after 12 of 44", body: "4.10 GB → 1.20 GB (29% of the original)\n12 compressed · 32 not started\nThe other 32 are untouched." });
   started({ id: 5, title: "12 photos → JPG", via: "Claude Desktop" });
   progress({ id: 5, fraction: 0.42, detail: "File 5 of 12" });
   progress({ id: 1, fraction: 0.42, detail: "42%" });

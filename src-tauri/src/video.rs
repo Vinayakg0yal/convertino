@@ -439,6 +439,17 @@ fn encoder_args(enc: &str, q: Quality, width: u32, height: u32) -> Vec<String> {
     encoder_args_at(enc, default_knob(enc, q), q, width, height)
 }
 
+/// Video encode settings for folder jobs (clips joined into one, image
+/// sequences): the first working encoder for `codec` (H.264 when there's
+/// none), at the Balanced look, or Best.
+pub fn encode_args(codec: Codec, best: bool, width: u32, height: u32) -> Result<Vec<String>, String> {
+    let q = if best { Quality { tier: Tier::Best, look: 95.5, effort: 1, encoder: crate::tune::Encoder::Auto, recheck: 10, step: 1 } } else { Quality::High };
+    let enc = encoder(codec)
+        .or_else(|| if codec != Codec::H264 { encoder(Codec::H264) } else { None })
+        .ok_or("This FFmpeg has no working H.264 encoder.")?;
+    Ok(encoder_args(enc, q, width, height))
+}
+
 /// Encoder settings with the constant-quality setting at `v`.
 fn encoder_args_at(enc: &str, v: u32, q: Quality, width: u32, height: u32) -> Vec<String> {
     let v = v.to_string();

@@ -368,6 +368,85 @@ pub fn item_at(x: f64, y: f64) -> Option<PathBuf> {
     }
 }
 
+/// Empty space in a Finder window: the folder it shows; on the desktop, the
+/// Desktop folder. None when the pointer isn't over Finder.
+pub fn folder_at(x: f64, y: f64) -> Option<PathBuf> {
+    if !finder_at(CGPoint { x, y }) {
+        return None;
+    }
+    unsafe {
+        let system = AXUIElementCreateSystemWide();
+        if system.is_null() {
+            return None;
+        }
+        let mut el: AXUIElementRef = std::ptr::null();
+        let err = AXUIElementCopyElementAtPosition(system, x as f32, y as f32, &mut el);
+        CFRelease(system);
+        if err != 0 || el.is_null() {
+            return None;
+        }
+        let (k_role, k_doc, k_parent) = (CfStr::new("AXRole"), CfStr::new("AXDocument"), CfStr::new("AXParent"));
+        let mut current = el;
+        let mut found = None;
+        let mut in_window = false;
+        for _ in 0..25 {
+            let mut role: CFTypeRef = std::ptr::null();
+            let is_window = AXUIElementCopyAttributeValue(current, k_role.0, &mut role) == 0 && {
+                let r = cf_string(role);
+                if !role.is_null() {
+                    CFRelease(role);
+                }
+                r.as_deref() == Some("AXWindow")
+            };
+            if is_window {
+                in_window = true;
+                // A Finder window's document is its folder, as a file:// URL.
+                let mut doc: CFTypeRef = std::ptr::null();
+                if AXUIElementCopyAttributeValue(current, k_doc.0, &mut doc) == 0 && !doc.is_null() {
+                    found = cf_string(doc).and_then(|u| file_url_path(&u));
+                    CFRelease(doc);
+                }
+                break;
+            }
+            let mut parent: CFTypeRef = std::ptr::null();
+            if AXUIElementCopyAttributeValue(current, k_parent.0, &mut parent) != 0 || parent.is_null() {
+                break;
+            }
+            CFRelease(current);
+            current = parent;
+        }
+        CFRelease(current);
+        if found.is_none() && !in_window {
+            // The desktop isn't a window: its folder is ~/Desktop.
+            found = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Desktop"));
+        }
+        found.filter(|p| p.is_dir())
+    }
+}
+
+/// "file:///Users/me/My%20Folder/" -> /Users/me/My Folder
+fn file_url_path(url: &str) -> Option<PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?, 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    let s = String::from_utf8(out).ok()?;
+    let s = s.trim_end_matches('/');
+    Some(PathBuf::from(if s.is_empty() { "/" } else { s }))
+}
+
 // ---------------------------------------------------------------------------
 // Permissions
 

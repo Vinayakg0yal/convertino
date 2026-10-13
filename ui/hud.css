@@ -91,3 +91,19 @@ html, body { margin: 0; background: transparent; overflow: hidden; font: 13px/1.
 :root[data-os="mac"] .buttons button { border-radius: 7px; }
 
 @media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; transition-duration: 0s !important; } }
+
+/* Folder jobs: what's been saved so far, two ways to stop, and every file's fate. */
+.extra { font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.extra[hidden] { display: none; }
+.row.stops { justify-content: flex-end; gap: 4px; }
+.row.stops .cancel { margin-right: 0; }
+.buttons button.primary { background: var(--accent); border-color: transparent; color: #fff; font-weight: 600; }
+@media (prefers-color-scheme: dark) { .buttons button.primary { color: #00253a; } }
+.buttons button.primary:hover { filter: brightness(1.06); background: var(--accent); }
+.details { border-top: 1px solid var(--line); padding-top: 6px; display: flex; flex-direction: column; gap: 1px; max-height: 220px; overflow-y: auto; }
+.drow { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; font-size: 12px; padding: 1px 0; }
+.drow .f { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drow .s { max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; text-align: right; }
+.drow .ok { color: var(--good); }
+.drow .bad { color: var(--bad); }
+.drow .dim { color: var(--ink-3); }

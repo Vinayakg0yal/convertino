@@ -35,6 +35,7 @@ Don't ask for an upload and don't say you can't reach their files: Convertino ca
 Pictures (including camera RAW), audio, video, PDF, documents, spreadsheets/data and archives. \
 Call list_conversions first to see what a file can become, then convert (to: \"compress\" for \"make it smaller\" with no size given) or compress_to_size (when a size or a limit like Discord or email is named). \
 Paths must be absolute. Results are saved next to the originals (or in outFolder); originals are never changed and existing files are never overwritten. \
+Folders work too: give a folder's path to convert (to: compress, zip, join, merge-pdf, sequence, mp4, jpg, …) or compress_to_size (the whole folder fits the size); results go in a new folder next to it unless into says otherwise. \
 Tell the user where the new files are and how big they are.";
 
 // ---------- output ----------
@@ -63,7 +64,7 @@ fn paths_schema() -> Value {
         "type": "array",
         "items": { "type": "string" },
         "minItems": 1,
-        "description": "Absolute paths of the files. ~ means the home folder. Wildcards like C:\\Photos\\*.CR3 work."
+        "description": "Absolute paths of the files, or of folders (everything inside). ~ means the home folder. Wildcards like C:\\Photos\\*.CR3 work."
     })
 }
 
@@ -81,7 +82,8 @@ pub fn tools() -> Value {
             "title": "Convert files",
             "description": "Works on files on the user's computer (local paths like E:\\Videos\\clip.mp4 or ~/Photos/…); no upload needed. Converts files to another format, or runs an action on them: compress (make files smaller without a set size), split, merge, extract, 720p, frames, camera-jpg, …). \
 Pictures, RAW photos, audio, video, PDF, documents, data and archives. New files are saved next to the originals unless outFolder is given; originals are never changed and nothing is overwritten. \
-Several files of the same kind are converted together (merge needs two or more PDFs).",
+Several files of the same kind are converted together (merge needs two or more PDFs). \
+A folder's path works on everything inside: compress, zip, 7z, join (clips into one video), merge-pdf, photos-pdf, sequence (numbered frames into a video), audio, normalize, no-gps, extract, sheets, or a format such as mp4 or jpg; results go in a new folder next to it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -89,7 +91,9 @@ Several files of the same kind are converted together (merge needs two or more P
                     "to": { "type": "string", "description": "A name from list_conversions, e.g. jpg, png, webp, pdf, mp3, mp4, docx, xlsx, json, zip, compress, split, merge, extract, 720p, camera-jpg." },
                     "quality": { "type": ["string", "number"], "description": "Optional. small, balanced or best (as tuned in Convertino; default: as set there; balanced = looks the same as the original), or a number: how close the result must look, on the preset's own score (pictures and PDFs about 70–87, video about 89–96)." },
                     "tune": { "type": "object", "description": "Optional one-off preset settings for this job: look (number), floor (30–90), png (quick|normal|thorough), stripGps (true removes the photo's GPS location), codec (h265|h264|av1), maxRes (2160|1440|1080|720|0), maxFps (60|30|0), audio (96|128|192), encoder (gpu|cpu|auto), effort (faster|medium|slower), recheck (1–20), checkDpi (110|150|200).", "additionalProperties": true },
-                    "outFolder": { "type": "string", "description": "Optional absolute folder to save into instead of next to the originals." }
+                    "outFolder": { "type": "string", "description": "Optional absolute folder to save into instead of next to the originals (files only)." },
+                    "into": { "type": "string", "enum": ["new", "beside", "replace"], "description": "Folders only. Where results go: new (a new folder next to it, default), beside (next to each original), replace (the originals move to a \"Convertino originals\" folder next to it; only when the user asks)." },
+                    "subfolders": { "type": "boolean", "description": "Folders only. Include files in subfolders (default true)." }
                 },
                 "required": ["paths", "to"]
             },
@@ -106,7 +110,9 @@ Files already under the size are left alone (except RAW photos, which always bec
                     "paths": paths_schema(),
                     "size": { "type": "string", "description": "Largest size, decimal units: \"25MB\", \"800KB\", \"1.5GB\" (10MB = 10,000,000 bytes)." },
                     "together": { "type": "boolean", "description": "With several files: the size is for all of them together. Default false (each file)." },
-                    "outFolder": { "type": "string", "description": "Optional absolute folder to save into." }
+                    "outFolder": { "type": "string", "description": "Optional absolute folder to save into." },
+                    "as": { "type": "string", "enum": ["folder", "zip", "parts"], "description": "Folders only. folder: a compressed copy that fits (default); zip: one zip that fits; parts: an untouched zip in pieces of the size." },
+                    "subfolders": { "type": "boolean", "description": "Folders only. Include files in subfolders (default true)." }
                 },
                 "required": ["paths", "size"]
             },
@@ -183,7 +189,140 @@ fn out_folder(args: &Value) -> Result<Option<PathBuf>, String> {
     }
 }
 
+/// The paths, when every one of them is a folder.
+fn folders_from(args: &Value) -> Option<Vec<PathBuf>> {
+    let list: Vec<String> = match args.get("paths") {
+        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        Some(Value::String(s)) => vec![s.clone()],
+        _ => return None,
+    };
+    let dirs: Vec<PathBuf> = list
+        .iter()
+        .map(|raw| match raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+            Some(rest) => home().map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(raw)),
+            None => PathBuf::from(raw),
+        })
+        .filter(|p| p.is_absolute() && p.is_dir())
+        .map(|p| cli::strip_verbatim(&p))
+        .collect();
+    (!list.is_empty() && dirs.len() == list.len()).then_some(dirs)
+}
+
+/// What a folder holds and what can be done with it.
+fn list_folder(roots: &[PathBuf]) -> ToolResult {
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let scan = match crate::folder::scan(roots, &never, &|_| {}) {
+        Ok(s) => s,
+        Err(e) => return ToolResult::fail(e),
+    };
+    let prefs = settings::get();
+    let d = crate::folder::Defaults::default();
+    let cands = crate::folder::candidates(&scan, &d, &prefs);
+    let actions: Vec<Value> = cands.iter().map(|(a, p)| json!({ "action": a.id(), "label": p.label, "files": p.files.len(), "what": p.what })).collect();
+    let mut text = format!(
+        "{}: {} files, {} ({} subfolders; {} hidden or system files left alone).\nWhat convert can do with it:\n",
+        scan.name(),
+        scan.items.len(),
+        engine::human_size(scan.bytes()),
+        scan.subfolders,
+        scan.alone.len()
+    );
+    for (_, p) in &cands {
+        text.push_str(&format!("- {} ({}): {}\n", p.label, p.sub, p.what));
+    }
+    text.push_str(&format!("Names for `to`: {}.\ncompress_to_size fits the whole folder in a size.", crate::folder::WORDS));
+    ToolResult { text, data: json!({ "folder": scan.name(), "files": scan.items.len(), "bytes": scan.bytes(), "actions": actions }), error: false }
+}
+
+/// convert / compress_to_size on folders.
+fn folder_tool(args: &Value, ctx: &Ctx, size: Option<size::Ask>, roots: Vec<PathBuf>) -> ToolResult {
+    use crate::folder;
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let scan = match folder::scan(&roots, &never, &|_| {}) {
+        Ok(s) => s,
+        Err(e) => return ToolResult::fail(e),
+    };
+    let mut opts = folder::Opts { subfolders: args.get("subfolders").and_then(Value::as_bool).unwrap_or(true), ..folder::Opts::default() };
+    opts.into = match args.get("into").and_then(Value::as_str).unwrap_or("new") {
+        "beside" => folder::Into::Beside,
+        "replace" => folder::Into::Replace,
+        "new" => folder::Into::New,
+        other => return ToolResult::fail(format!("into is new, beside or replace, not \"{other}\".")),
+    };
+    if let Some(a) = size {
+        let mode = match args.get("as").and_then(Value::as_str).unwrap_or("folder") {
+            "zip" => folder::FitMode::Zip,
+            "parts" => folder::FitMode::Parts,
+            "folder" => folder::FitMode::Folder,
+            other => return ToolResult::fail(format!("as is folder, zip or parts, not \"{other}\".")),
+        };
+        opts.fit = Some(folder::Fit { bytes: a.bytes, mode });
+    }
+    let word = if size.is_some() { String::new() } else { args.get("to").and_then(Value::as_str).unwrap_or("").to_string() };
+    let (actions, pack) = match folder::actions_for_word(&scan, &word, size.is_some(), opts.subfolders) {
+        Ok(a) => a,
+        Err(e) => return ToolResult::fail(e),
+    };
+    if let Some(p) = pack {
+        opts.pack = p;
+    }
+    let prefs = settings::get();
+    let mut all = engine::Outcome::default();
+    let mut lines = Vec::new();
+    let total = actions.len() as f64;
+    for (n, action) in actions.iter().enumerate() {
+        let plan = match folder::plan(&scan, action, &opts, &prefs.quality, &prefs) {
+            Ok(p) => p,
+            Err(e) => {
+                lines.push(e);
+                continue;
+            }
+        };
+        let id = engine::new_id();
+        if let Ok(mut j) = ctx.jobs.lock() {
+            j.push(id);
+        }
+        let live = Live::start(id, &ctx.client, &plan.title);
+        let (progress, l2) = (ctx.progress.clone(), live.clone());
+        let on: folder::OnLive = Arc::new(move |l: folder::Live| {
+            progress((n as f64 + l.fraction) / total, &l.detail);
+            l2.progress(l.fraction, &l.detail);
+        });
+        let l3 = live.clone();
+        let dl: folder::OnDownload = Arc::new(move |fraction, detail| l3.progress(fraction, &detail));
+        let cancel_watch = live.watch_cancel(id);
+        let o = folder::run(id, &plan, on, dl);
+        drop(cancel_watch);
+        let eo = engine::Outcome { made: o.made.clone(), made_from: o.made_from.clone(), failed: o.failures.clone(), cancelled: o.cancelled, notes: o.notes.clone() };
+        live.done(&eo, &plan.title);
+        lines.push(format!("{}: {}", plan.title, folder::summary(&plan, &o)));
+        all.made.extend(eo.made);
+        all.made_from.extend(eo.made_from);
+        all.failed.extend(eo.failed);
+        all.notes.extend(eo.notes);
+        all.cancelled |= eo.cancelled;
+        if all.cancelled {
+            break;
+        }
+    }
+    let place = match opts.into {
+        folder::Into::New => "in a new folder next to it",
+        folder::Into::Beside => "next to each original",
+        folder::Into::Replace => "in place of the originals (the originals are in \"Convertino originals\" next to the folder)",
+    };
+    let mut result = summary(&all, &[], place);
+    result.text = format!("{}\n{}", lines.join("\n"), result.text);
+    if let Value::Object(m) = &mut result.data {
+        m.insert("folder".into(), json!(lines));
+    }
+    log_job(&ctx.client, if word.is_empty() { "fit" } else { &word }, &roots, &all, &result);
+    result
+}
+
 fn list_conversions(args: &Value) -> ToolResult {
+    if let Some(roots) = folders_from(args) {
+        return list_folder(&roots);
+    }
     let files = match files_from(args) {
         Ok(f) => f,
         Err(e) => return ToolResult::fail(e),
@@ -252,6 +391,9 @@ pub struct Ctx {
 fn convert_tool(args: &Value, ctx: &Ctx, size: Option<size::Ask>) -> ToolResult {
     if !settings::get().ai_apps {
         return ToolResult::fail("AI apps are turned off in Convertino Settings (AI & CLI). Ask the person to turn them on.");
+    }
+    if let Some(roots) = folders_from(args) {
+        return folder_tool(args, ctx, size, roots);
     }
     let files = match files_from(args) {
         Ok(f) => f,
@@ -326,7 +468,7 @@ fn convert_tool(args: &Value, ctx: &Ctx, size: Option<size::Ask>) -> ToolResult 
                 progress((n as f64) / total, &detail);
                 l2.progress(fraction, &detail);
             }
-            Event::StepDone { .. } => {}
+            Event::StepDone { .. } | Event::StepStarted { .. } => {}
         });
         let cancel_watch = live.watch_cancel(id);
         let req = Request {

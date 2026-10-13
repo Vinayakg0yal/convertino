@@ -6,7 +6,7 @@
 //! → `IFolderView2::GetSelection` → file-system paths.
 
 use super::dialog;
-use super::Selection;
+use super::{Selection, Under};
 use std::path::PathBuf;
 use ::windows::core::{w, Interface, PCWSTR, PWSTR};
 use ::windows::Win32::Foundation::HWND;
@@ -59,6 +59,15 @@ pub fn current_selection() -> Res<Selection> {
 /// The selection in a given top-level window (from Alt+right-click), or in
 /// the foreground window when `root` is None.
 pub fn selection_for(root: Option<isize>) -> Res<Selection> {
+    read_view(root, false)
+}
+
+/// The folder an Explorer window (or the desktop) shows, for Alt+right-click on empty space.
+pub fn folder_for(root: Option<isize>) -> Res<Selection> {
+    read_view(root, true)
+}
+
+fn read_view(root: Option<isize>, folder: bool) -> Res<Selection> {
     unsafe {
         let _com = ComGuard(CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok());
 
@@ -74,9 +83,9 @@ pub fn selection_for(root: Option<isize>) -> Res<Selection> {
             .map_err(err("Couldn't reach the Windows shell"))?;
 
         match class.as_str() {
-            "CabinetWClass" | "ExploreWClass" => explorer_selection(&shell_windows, fg),
-            "Progman" | "WorkerW" => desktop_selection(&shell_windows),
-            "#32770" => dialog_selection(fg),
+            "CabinetWClass" | "ExploreWClass" => explorer_selection(&shell_windows, fg, folder),
+            "Progman" | "WorkerW" => desktop_selection(&shell_windows, folder),
+            "#32770" if !folder => dialog_selection(fg),
             other => {
                 log::info!("hotkey pressed in a window of class {other}");
                 Err("Hold Alt and right-click a file in File Explorer or on the desktop. (Or select files first, then press your shortcut.)".into())
@@ -102,7 +111,7 @@ unsafe fn class_name(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..len.max(0) as usize])
 }
 
-unsafe fn explorer_selection(shell_windows: &IShellWindows, fg: HWND) -> Res<Selection> {
+unsafe fn explorer_selection(shell_windows: &IShellWindows, fg: HWND, folder: bool) -> Res<Selection> {
     // Win11 Explorer keeps every tab in one top-level window. The first
     // ShellTabWindowClass child is the tab currently shown.
     let active_tab = FindWindowExW(Some(fg), None, w!("ShellTabWindowClass"), PCWSTR::null()).ok();
@@ -127,14 +136,15 @@ unsafe fn explorer_selection(shell_windows: &IShellWindows, fg: HWND) -> Res<Sel
         }
         return Ok(Selection {
             source: "File Explorer".into(),
-            paths: selected_paths(&browser)?,
-        ..Default::default()
+            paths: if folder { view_folder(&browser)? } else { selected_paths(&browser)? },
+            blank: folder,
+            ..Default::default()
         });
     }
     Err("Couldn't find the active Explorer tab".into())
 }
 
-unsafe fn desktop_selection(shell_windows: &IShellWindows) -> Res<Selection> {
+unsafe fn desktop_selection(shell_windows: &IShellWindows, folder: bool) -> Res<Selection> {
     let location = variant_i4(CSIDL_DESKTOP as i32);
     let root = VARIANT::default();
     let mut hwnd: i32 = 0;
@@ -147,9 +157,21 @@ unsafe fn desktop_selection(shell_windows: &IShellWindows) -> Res<Selection> {
         .map_err(err("Couldn't reach the desktop view"))?;
     Ok(Selection {
         source: "Desktop".into(),
-        paths: selected_paths(&browser)?,
+        paths: if folder { view_folder(&browser)? } else { selected_paths(&browser)? },
+        blank: folder,
         ..Default::default()
     })
+}
+
+/// The folder a view shows ("This PC" and other virtual places have none).
+unsafe fn view_folder(browser: &IShellBrowser) -> Res<Vec<String>> {
+    let view = browser.QueryActiveShellView().map_err(err("Couldn't read the folder view"))?;
+    let folder_view: IFolderView2 = view.cast().map_err(err("Unsupported folder view"))?;
+    let item: IShellItem = folder_view.GetFolder().map_err(err("Couldn't read the folder"))?;
+    match item.GetDisplayName(SIGDN_FILESYSPATH) {
+        Ok(p) => Ok(vec![pwstr_to_string(p)]),
+        Err(_) => Err("This place isn't an ordinary folder (This PC, a phone, inside a ZIP). Open a folder first.".into()),
+    }
 }
 
 unsafe fn selected_paths(browser: &IShellBrowser) -> Res<Vec<String>> {
@@ -346,8 +368,9 @@ unsafe fn pwstr_to_string(p: PWSTR) -> String {
 
 /// Makes sure the file under the pointer is selected, like a normal
 /// right-click does: an unselected item becomes the only selection, a
-/// selected item keeps the whole selection. Returns true if a file was there.
-pub fn select_item_at(x: i32, y: i32) -> Res<bool> {
+/// selected item keeps the whole selection. Says whether a file, the empty
+/// space among the files, or something else was under the pointer.
+pub fn select_item_at(x: i32, y: i32) -> Res<Under> {
     // UI Automation clients work best on their own multithreaded apartment.
     std::thread::spawn(move || unsafe {
         let _com = ComGuard(CoInitializeEx(None, COINIT_MULTITHREADED).is_ok());
@@ -369,14 +392,18 @@ pub fn select_item_at(x: i32, y: i32) -> Res<bool> {
                     // Give Explorer a moment to update its selection.
                     std::thread::sleep(std::time::Duration::from_millis(60));
                 }
-                return Ok(true);
+                return Ok(Under::Item);
+            }
+            // Reached the list of files without passing an item: empty space.
+            if element.CurrentControlType().ok() == Some(UIA_ListControlTypeId) {
+                return Ok(Under::Blank);
             }
             match walker.GetParentElement(&element) {
                 Ok(parent) => element = parent,
                 Err(_) => break,
             }
         }
-        Ok(false)
+        Ok(Under::Other)
     })
     .join()
     .map_err(|_| "UI Automation crashed".to_string())?

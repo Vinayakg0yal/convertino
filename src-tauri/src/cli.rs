@@ -3,6 +3,7 @@
 //! ```text
 //! convertino <files…> --to <target> [--size 25MB] [--quality small|balanced|best]
 //!            [--out <folder>] [--together] [--json] [--progress] [--quiet]
+//! convertino <folders…> --to <action|format> [--into new|beside|replace] [--no-subfolders] …
 //! convertino formats <files…> [--json]
 //! convertino tools [status | install <name> | install --all] [--json]
 //! convertino mcp
@@ -46,6 +47,7 @@ Usage:
   convertino <files…> --to <format>      convert (jpg, png, mp3, mp4, pdf, docx, …)
   convertino <files…> --size <size>      compress to a size (25MB, 800KB, 1.5GB)
   convertino formats <files…>            what the files can become
+  convertino <folder> --to <action>      everything in a folder: compress, zip, join, …
   convertino tools                       which converters are ready
   convertino tools install <name|--all>  download converters now
   convertino mcp                         run as an MCP server (AI apps start this)
@@ -70,6 +72,25 @@ Options:
   --progress           progress as JSON lines on stderr, for apps that run Convertino
   --quiet              print nothing but errors
   -h, --help           this help
+
+Folders (give one or more folders instead of files):
+  --to <action>        compress, fit (with --size), zip, 7z, tar.gz, merge-pdf, photos-pdf,
+                       join, join-audio, sequence, sequence-gif, audio, normalize, no-gps,
+                       extract, sheets, or a format (mp4, jpg, mp3, …) for every file it fits
+  --into <where>       new (a new folder next to it, the default), beside (next to each
+                       original) or replace (the originals move to \"Convertino originals\"
+                       next to the folder once the new copy checks out)
+  --no-subfolders      only the files directly in the folder
+  --redo-done          convert files again even when an earlier result is still there
+  --size <size> --as <a>  fit the folder in a size: as folder (a compressed copy, default),
+                       zip (one zip) or parts (an untouched zip in pieces of that size)
+  --order <o>          name (default) or date: the order for join, merge-pdf, photos-pdf, sheets
+  --fps <n> --format <f>  sequence: frames per second (24) and mp4, h265, prores, webm or gif
+  --sound              sequence: add the folder's audio file as the sound
+  --stop-at-gaps       sequence: stop when a frame is missing (default: hold the one before)
+  --password <text>    zip / 7z: protect it (AES-256)
+  --parts <size>       zip / 7z: in pieces of this size
+  Hidden and system files are left alone; --json lists every file and what happened to it.
   -V, --version        the version
 
 Originals are never changed, and existing files are never overwritten:
@@ -90,6 +111,12 @@ pub struct ConvertArgs {
     pub json: bool,
     pub progress: bool,
     pub quiet: bool,
+    /// Folders to work on (instead of files).
+    pub folders: Vec<PathBuf>,
+    /// Folder choices (--into, --no-subfolders, …).
+    pub folder: crate::folder::Opts,
+    /// A folder-only option was given (an error with files).
+    pub folder_flag: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -204,6 +231,78 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             "--presets" => c.presets = Some(PathBuf::from(take(&mut i, "--presets")?)),
             "--out" | "-o" => c.out = Some(PathBuf::from(take(&mut i, "--out")?)),
             "--together" => c.together = true,
+            "--into" => {
+                let v = take(&mut i, "--into")?.to_lowercase();
+                c.folder.into = match v.as_str() {
+                    "new" | "new-folder" => crate::folder::Into::New,
+                    "beside" | "next" | "next-to" => crate::folder::Into::Beside,
+                    "replace" => crate::folder::Into::Replace,
+                    _ => return Err(usage(format!("--into is new, beside or replace, not \"{v}\"."))),
+                };
+                c.folder_flag.get_or_insert("--into".into());
+            }
+            "--no-subfolders" => {
+                c.folder.subfolders = false;
+                c.folder_flag.get_or_insert("--no-subfolders".into());
+            }
+            "--redo-done" => {
+                c.folder.skip_done = false;
+                c.folder_flag.get_or_insert("--redo-done".into());
+            }
+            "--as" => {
+                let v = take(&mut i, "--as")?.to_lowercase();
+                let mode = match v.as_str() {
+                    "folder" => crate::folder::FitMode::Folder,
+                    "zip" => crate::folder::FitMode::Zip,
+                    "parts" => crate::folder::FitMode::Parts,
+                    _ => return Err(usage(format!("--as is folder, zip or parts, not \"{v}\"."))),
+                };
+                c.folder.fit = Some(crate::folder::Fit { bytes: 0, mode });
+                c.folder_flag.get_or_insert("--as".into());
+            }
+            "--order" => {
+                let v = take(&mut i, "--order")?.to_lowercase();
+                c.folder.order = match v.as_str() {
+                    "name" => crate::folder::Order::Name,
+                    "date" => crate::folder::Order::Date,
+                    _ => return Err(usage(format!("--order is name or date, not \"{v}\"."))),
+                };
+                c.folder_flag.get_or_insert("--order".into());
+            }
+            "--fps" => {
+                let v = take(&mut i, "--fps")?;
+                c.folder.fps = v.parse::<f64>().ok().filter(|f| *f >= 1.0 && *f <= 240.0).ok_or_else(|| usage(format!("--fps is a number from 1 to 240, not \"{v}\".")))?;
+                c.folder_flag.get_or_insert("--fps".into());
+            }
+            "--format" => {
+                let v = take(&mut i, "--format")?.to_lowercase();
+                c.folder.format = match v.as_str() {
+                    "mp4" | "h264" => crate::folder::SeqFormat::Mp4,
+                    "h265" | "hevc" => crate::folder::SeqFormat::H265,
+                    "prores" | "mov" => crate::folder::SeqFormat::Prores,
+                    "webm" => crate::folder::SeqFormat::Webm,
+                    "gif" => crate::folder::SeqFormat::Gif,
+                    _ => return Err(usage(format!("--format is mp4, h265, prores, webm or gif, not \"{v}\"."))),
+                };
+                c.folder_flag.get_or_insert("--format".into());
+            }
+            "--sound" => {
+                c.folder.sound = true;
+                c.folder_flag.get_or_insert("--sound".into());
+            }
+            "--stop-at-gaps" => {
+                c.folder.gaps = crate::folder::Gaps::Stop;
+                c.folder_flag.get_or_insert("--stop-at-gaps".into());
+            }
+            "--password" => {
+                c.folder.password = Some(take(&mut i, "--password")?);
+                c.folder_flag.get_or_insert("--password".into());
+            }
+            "--parts" => {
+                let v = take(&mut i, "--parts")?;
+                c.folder.parts = Some(parse_size(&v).ok_or_else(|| usage(format!("\"{v}\" isn't a size. Try 25MB or 2GB.")))?);
+                c.folder_flag.get_or_insert("--parts".into());
+            }
             "--json" => c.json = true,
             "--progress" => c.progress = true,
             "--quiet" => c.quiet = true,
@@ -237,6 +336,28 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         _ => {
             if rest.is_empty() {
                 return Err(usage("Which files? Example: convertino photo.png --to jpg"));
+            }
+            // Folders: everything inside (folder.rs).
+            let dirs: Vec<&String> = rest.iter().filter(|a| Path::new(a.as_str()).is_dir()).collect();
+            if !dirs.is_empty() {
+                if dirs.len() != rest.len() {
+                    return Err(usage(format!("{} is a folder. Give only folders, or only files ({}{}* for the files in it).", dirs[0], dirs[0], std::path::MAIN_SEPARATOR)));
+                }
+                if c.to.is_none() && c.size.is_none() {
+                    return Err(usage(format!("Do what with the folder? Add --to with one of: {}.", crate::folder::WORDS)));
+                }
+                if c.together {
+                    return Err(usage("--together is for files; a folder's size is always for all of it."));
+                }
+                if c.folder.fit.is_some() && c.size.is_none() {
+                    return Err(usage("--as needs --size (the size to fit the folder in)."));
+                }
+                quality_with(None, None, &c.tune).map_err(usage)?;
+                c.folders = rest.iter().map(PathBuf::from).map(|p| std::path::absolute(&p).unwrap_or(p)).map(|p| strip_verbatim(&p)).collect();
+                return Ok(Command::Convert(c));
+            }
+            if let Some(flag) = &c.folder_flag {
+                return Err(usage(format!("{flag} works with folders only.")));
             }
             if c.to.is_none() && c.size.is_none() {
                 return Err(usage("Convert to what? Add --to <format> (or --size for Compress)."));
@@ -277,7 +398,7 @@ pub fn expand(args: &[String]) -> Result<Vec<PathBuf>, String> {
             found.sort();
             out.extend(found);
         } else if p.is_dir() {
-            return Err(usage(format!("{a} is a folder. Use {a}{}* for the files in it.", std::path::MAIN_SEPARATOR)));
+            return Err(usage(format!("{a} is a folder. Give only folders (convertino {a} --to compress), or use {a}{}* for the files in it.", std::path::MAIN_SEPARATOR)));
         } else if !p.exists() {
             return Err(usage(format!("File not found: {a}")));
         } else {
@@ -660,6 +781,7 @@ pub fn run_convert(c: &ConvertArgs) -> i32 {
                 }
                 b.draw("Downloading", fraction, &detail)
             }
+            Event::StepStarted { .. } => {}
             Event::StepDone { inputs, result, seconds, .. } => {
                 if quiet || json {
                     if let (Err(e), false) = (&result, json) {
@@ -738,6 +860,162 @@ pub fn run_convert(c: &ConvertArgs) -> i32 {
             outln!("{}{}", style.green(&format!("✓ {made_count} converted")), style.dim(&format!(" · {place}")));
         } else {
             outln!("{}{}", style.red(&format!("✗ {} failed", failed.len())), style.dim(&format!(" · {made_count} converted, {place}")));
+        }
+    }
+    if cancelled {
+        EXIT_CANCELLED
+    } else if failed.is_empty() {
+        EXIT_OK
+    } else {
+        EXIT_FAILED
+    }
+}
+
+/// A folder job's every file, for --json.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonFolderResult {
+    schema: u32,
+    ok: bool,
+    cancelled: bool,
+    outputs: Vec<JsonOutput>,
+    failed: Vec<JsonFailure>,
+    notes: Vec<String>,
+    /// Every file in the folder and what happened to it.
+    files: Vec<crate::folder::Row>,
+}
+
+/// Runs a command on folders; returns the exit code.
+pub fn run_folders(c: &ConvertArgs) -> i32 {
+    use crate::folder;
+    let style = Style { on: !c.json && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() && enable_ansi() };
+    let bar = Arc::new(Bar { on: !c.json && !c.quiet && std::io::stderr().is_terminal() && style.on, shown: Mutex::new(false) });
+    let fail_usage = |msg: String| {
+        errln!("{} {msg}", style.red("✗"));
+        EXIT_USAGE
+    };
+    let quality = match quality_with(c.quality.as_deref(), c.presets.as_deref(), &c.tune) {
+        Ok(q) => q.unwrap_or_else(|| settings::get().quality),
+        Err(e) => return fail_usage(e),
+    };
+    let never = AtomicBool::new(false);
+    let scan = match folder::scan(&c.folders, &never, &|_| {}) {
+        Ok(s) => s,
+        Err(e) => return fail_usage(e),
+    };
+    if scan.items.is_empty() {
+        return fail_usage(format!("{} is empty (apart from hidden and system files).", scan.name()));
+    }
+    let word = c.to.clone().unwrap_or_default();
+    let (actions, pack) = match folder::actions_for_word(&scan, &word, c.size.is_some(), c.folder.subfolders) {
+        Ok(a) => a,
+        Err(e) => return fail_usage(e),
+    };
+    let mut opts = c.folder.clone();
+    if let Some(p) = pack {
+        opts.pack = p;
+    }
+    if let Some(bytes) = c.size {
+        opts.fit = Some(folder::Fit { bytes, mode: opts.fit.map(|f| f.mode).unwrap_or_default() });
+    }
+    let prefs = settings::get();
+    let mut outputs = Vec::new();
+    let mut failed: Vec<(PathBuf, String)> = Vec::new();
+    let mut notes = Vec::new();
+    let mut rows: Vec<folder::Row> = Vec::new();
+    let mut cancelled = false;
+    let mut made = 0usize;
+    let mut summaries = Vec::new();
+    for action in &actions {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            cancelled = true;
+            break;
+        }
+        let plan = match folder::plan(&scan, action, &opts, &quality, &prefs) {
+            Ok(p) => p,
+            Err(e) if e.starts_with(folder::ALREADY_DONE) => {
+                notes.push(e);
+                continue;
+            }
+            Err(e) => {
+                if actions.len() == 1 {
+                    return fail_usage(e);
+                }
+                notes.push(e);
+                continue;
+            }
+        };
+        let id = engine::new_id();
+        CURRENT.store(id, Ordering::SeqCst);
+        let jp = c.progress.then(|| Arc::new(JsonProgress::new()));
+        let (b, jp2) = (bar.clone(), jp.clone());
+        let title = plan.title.clone();
+        let t2 = title.clone();
+        let on: folder::OnLive = Arc::new(move |l: folder::Live| {
+            if let Some(j) = &jp {
+                j.emit("progress", &title, l.fraction, &l.detail);
+            }
+            b.draw(&title, l.fraction, &l.detail);
+        });
+        let b2 = bar.clone();
+        let dl: folder::OnDownload = Arc::new(move |fraction, detail| {
+            if let Some(j) = &jp2 {
+                j.emit("download", &t2, fraction, &detail);
+            }
+            b2.draw("Downloading", fraction, &detail);
+        });
+        let o = folder::run(id, &plan, on, dl);
+        bar.clear();
+        cancelled |= o.cancelled;
+        made += o.made_from.len();
+        for (inputs, out) in &o.made_from {
+            outputs.push(JsonOutput { path: out.clone(), sources: inputs.clone(), bytes: engine::disk_size(out), source_bytes: sources_size(inputs) });
+        }
+        failed.extend(o.failures.iter().cloned());
+        notes.extend(o.notes.iter().cloned());
+        summaries.push(format!("{}: {}", plan.title, folder::summary(&plan, &o)));
+        if !c.json && !c.quiet {
+            for r in o.rows.iter().filter(|r| r.kind != folder::RowKind::Alone) {
+                let mark = match r.kind {
+                    folder::RowKind::Done => style.green("✓"),
+                    folder::RowKind::Failed => style.red("✗"),
+                    _ => style.dim("·"),
+                };
+                outln!("  {mark} {}  {}", r.name, if r.kind == folder::RowKind::Done { r.status.clone() } else { style.dim(&r.status) });
+            }
+            let alone = o.left_alone();
+            if alone > 0 {
+                outln!("  {}", style.dim(&format!("{alone} left alone (see --json for each)")));
+            }
+        }
+        rows.extend(o.rows);
+        if o.cancelled {
+            break;
+        }
+    }
+    cancelled |= INTERRUPTED.load(Ordering::SeqCst);
+    if c.json {
+        print_json(&JsonFolderResult {
+            schema: 1,
+            ok: failed.is_empty() && !cancelled,
+            cancelled,
+            outputs,
+            failed: failed.iter().map(|(p, e)| JsonFailure { source: p.clone(), error: e.clone() }).collect(),
+            notes,
+            files: rows,
+        });
+    } else if !c.quiet {
+        for n in &notes {
+            outln!("  {}", style.dim(n));
+        }
+        for s in &summaries {
+            outln!("{}", if failed.is_empty() { style.green(&format!("✓ {s}")) } else { style.red(&format!("✗ {s}")) });
+        }
+        if summaries.is_empty() {
+            outln!("{}", style.green("✓ Nothing to do"));
+        }
+        if cancelled {
+            outln!("{}", style.red(&format!("Cancelled · {made} made before that")));
         }
     }
     if cancelled {
@@ -908,7 +1186,7 @@ pub fn main() -> i32 {
         Command::ToolsInstall { names, all, json } => run_tools_install(&names, all, json),
         Command::Convert(c) => {
             install_ctrl_c();
-            run_convert(&c)
+            if c.folders.is_empty() { run_convert(&c) } else { run_folders(&c) }
         }
     }
 }
@@ -1045,7 +1323,17 @@ mod tests {
         assert!(parse(&args(&[&a, "--to", "jpg", "--quality", "ultra"])).is_err());
         assert!(parse(&args(&[&a, "--to", "jpg", "--frobnicate"])).unwrap_err().contains("Unknown option"));
         assert!(parse(&args(&[d.join("missing.png").to_str().unwrap(), "--to", "jpg"])).unwrap_err().contains("not found"));
-        assert!(parse(&args(&[d.to_str().unwrap(), "--to", "jpg"])).unwrap_err().contains("folder"));
+        // A folder: everything inside (folder.rs); a folder mixed with files is a mistake.
+        let Command::Convert(c) = parse(&args(&[d.to_str().unwrap(), "--to", "jpg", "--into", "beside", "--no-subfolders"])).unwrap() else { panic!() };
+        assert_eq!(c.folders, vec![d.clone()]);
+        assert!(c.files.is_empty());
+        assert_eq!((c.folder.into, c.folder.subfolders), (crate::folder::Into::Beside, false));
+        assert!(parse(&args(&[d.to_str().unwrap(), &a, "--to", "jpg"])).unwrap_err().contains("folder"));
+        assert!(parse(&args(&[&a, "--to", "jpg", "--into", "new"])).unwrap_err().contains("folders only"));
+        assert!(parse(&args(&[d.to_str().unwrap()])).unwrap_err().contains("compress"));
+        assert!(parse(&args(&[d.to_str().unwrap(), "--to", "zip", "--as", "parts"])).unwrap_err().contains("--size"));
+        let Command::Convert(c) = parse(&args(&[d.to_str().unwrap(), "--size", "4GB", "--as", "zip"])).unwrap() else { panic!() };
+        assert_eq!(c.folder.fit.map(|f| f.mode), Some(crate::folder::FitMode::Zip));
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -21,11 +21,13 @@ thread_local! {
 struct Registry {
     running: HashMap<u64, HashSet<u32>>,
     cancelled: HashSet<u64>,
+    /// "Stop after this file": the file being converted finishes, no new one starts.
+    stopping: HashSet<u64>,
 }
 
 fn registry() -> &'static Mutex<Registry> {
     static R: OnceLock<Mutex<Registry>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(Registry { running: HashMap::new(), cancelled: HashSet::new() }))
+    R.get_or_init(|| Mutex::new(Registry { running: HashMap::new(), cancelled: HashSet::new(), stopping: HashSet::new() }))
 }
 
 /// Marks this thread as working for `job` (0: none).
@@ -39,6 +41,19 @@ pub fn current_job() -> u64 {
 
 pub fn is_cancelled(job: u64) -> bool {
     registry().lock().map(|r| r.cancelled.contains(&job)).unwrap_or(false)
+}
+
+/// "Stop after this file": the files being converted finish, no new one starts.
+pub fn stop_after_current(job: u64) {
+    if let Ok(mut r) = registry().lock() {
+        r.stopping.insert(job);
+    }
+    log::info!("job {job}: stopping after the current file");
+}
+
+/// The job was asked to stop after the current file (or cancelled).
+pub fn is_stopping(job: u64) -> bool {
+    registry().lock().map(|r| r.stopping.contains(&job) || r.cancelled.contains(&job)).unwrap_or(false)
 }
 
 /// True when the job on this thread was cancelled.

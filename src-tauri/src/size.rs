@@ -215,7 +215,7 @@ fn trim_num(v: f64, places: usize) -> String {
 }
 
 /// A tidy number near `bytes`: whole MB from 10 MB, half MB from 1 MB, 50 KB steps below.
-fn tidy(bytes: f64) -> u64 {
+pub fn tidy(bytes: f64) -> u64 {
     let mb = bytes / MB as f64;
     if mb >= 10.0 {
         (mb.round() as u64) * MB

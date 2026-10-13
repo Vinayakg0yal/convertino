@@ -32,11 +32,18 @@ pub fn archive_stem(path: &Path) -> String {
 
 /// Runs 7-Zip, reporting its percentage. 7-Zip redraws progress with
 /// backspaces rather than new lines, so output is split on those too.
-fn seven(args: &[&std::ffi::OsStr], cwd: Option<&Path>, progress: &mut dyn FnMut(f64)) -> Result<(), String> {
+pub(crate) fn seven(args: &[&std::ffi::OsStr], cwd: Option<&Path>, progress: &mut dyn FnMut(f64)) -> Result<(), String> {
     let exe = tools::require(Tool::SevenZip)?;
     let mut cmd = tools::command(&exe);
-    // -p with a dummy password: a protected archive fails at once instead of asking and hanging.
-    cmd.args(["-y", "-bsp1", "-bso0", "-bse2", "-p_convertino_"]).args(args);
+    // Reading: -p with a dummy password, so a protected archive fails at once
+    // instead of asking and hanging. Never when packing: 7-Zip would encrypt
+    // the new archive with it.
+    cmd.args(["-y", "-bsp1", "-bso0", "-bse2"]);
+    let packing = args.first().is_some_and(|a| *a == "a");
+    if !packing && !args.iter().any(|a| a.to_string_lossy().starts_with("-p")) {
+        cmd.arg("-p_convertino_");
+    }
+    cmd.args(args);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -225,6 +232,11 @@ mod tests {
             let output = crate::convert::unique_output(&d, "pack", ext);
             repack(&zip, pack, &output, &mut |_| {}).unwrap_or_else(|e| panic!("{ext}: {e}"));
             assert!(output.metadata().unwrap().len() > 50, "{ext}");
+            // Packing must never use the dummy password reading uses (it did before 0.2.9:
+            // repacked ZIP and 7Z archives asked for a password nobody knew).
+            let exe = tools::find(Tool::SevenZip).unwrap();
+            let listing = std::process::Command::new(exe).args(["l", "-slt", "-p"]).arg(&output).output().unwrap();
+            assert!(!String::from_utf8_lossy(&listing.stdout).contains("Encrypted = +"), "{ext} came out encrypted");
             if pack == Pack::TarGz {
                 // A .tar.gz extracts in one go, not to a .tar.
                 let back = extract(&output, &d, &mut |_| {}).unwrap();

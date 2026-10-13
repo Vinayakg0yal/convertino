@@ -50,6 +50,8 @@ struct Started {
     /// The AI app that asked for it (MCP), for the card's badge.
     #[serde(skip_serializing_if = "Option::is_none")]
     via: Option<String>,
+    /// A folder job: the card offers "Stop after this file" and "Stop now".
+    folder: bool,
 }
 
 /// Every job event goes to the ring (wheel window) and the corner card (HUD).
@@ -64,6 +66,9 @@ struct Progress {
     id: u64,
     fraction: f64,
     detail: String,
+    /// A second line ("Saved so far: 2.9 GB on 12 files").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -85,11 +90,20 @@ struct Done {
     compare: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     via: Option<String>,
+    /// Folder jobs: every file's fate (the card's Details).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<Vec<crate::folder::Row>>,
+    /// Folder jobs stopped with "Stop after this file": how many are left ("Carry on").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume: Option<usize>,
+    /// Undo puts the originals back (the results had replaced them).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    replaced: bool,
 }
 
 impl Done {
     fn plain(id: u64, ok: bool, title: String, body: String, can_undo: bool) -> Done {
-        Done { id, ok, title, body, can_undo, attention: false, fix: None, report: false, compare: false, via: None }
+        Done { id, ok, title, body, can_undo, attention: false, fix: None, report: false, compare: false, via: None, details: None, resume: None, replaced: false }
     }
 }
 
@@ -132,7 +146,7 @@ pub fn start(
         if !ring {
             crate::show_hud(&app);
         }
-        emit(&app, "job-started", Started { id, title, family, ring, via: None });
+        emit(&app, "job-started", Started { id, title, family, ring, via: None, folder: false });
 
         // From a Save dialog: the app hasn't written the file yet.
         if let Some(dialog) = wait_for_dialog {
@@ -233,7 +247,7 @@ pub fn start(
                 }
             }
             let attention = fix.is_some() || body.contains('\n');
-            Done { id, ok: true, title: done_title(&target_id, &label), body, can_undo: true, attention, fix, report, compare, via: None }
+            Done { attention, fix, report, compare, ..Done::plain(id, true, done_title(&target_id, &label), body, true) }
         };
         if let Ok(mut o) = outputs_map().lock() {
             o.insert(id, made);
@@ -263,7 +277,7 @@ pub fn start_steps(
         crate::procs::set_current_job(id);
         report_downloads(&app, id);
         crate::show_hud(&app);
-        emit(&app, "job-started", Started { id, title, family, ring: false, via: None });
+        emit(&app, "job-started", Started { id, title, family, ring: false, via: None, folder: false });
         let total = steps.len();
         let outcome = run_steps(&app, id, &steps);
         let errors = outcome.errors();
@@ -343,7 +357,7 @@ fn wait_for_save(app: &AppHandle, id: u64, dialog: isize, files: &[PathBuf]) -> 
             return Err(crate::procs::CANCELLED.into());
         }
         if !told {
-            emit(app, "job-progress", Progress { id, fraction: 0.0, detail: "Waiting for you to save…".into() });
+            emit(app, "job-progress", Progress { id, fraction: 0.0, detail: "Waiting for you to save…".into(), extra: None });
             told = true;
         }
         let open = crate::selection::window_open(dialog);
@@ -393,7 +407,7 @@ fn report_downloads(app: &AppHandle, id: u64) {
             return;
         }
         last.set(Instant::now());
-        emit(&reporter_app, "job-progress", Progress { id, fraction, detail: detail.to_string() });
+        emit(&reporter_app, "job-progress", Progress { id, fraction, detail: detail.to_string(), extra: None });
     });
 }
 
@@ -402,9 +416,9 @@ fn run_steps(app: &AppHandle, id: u64, steps: &[convert::Step]) -> crate::engine
     let a = app.clone();
     let sink: crate::engine::Sink = std::sync::Arc::new(move |e| match e {
         crate::engine::Event::Progress { fraction, detail } | crate::engine::Event::Download { fraction, detail } => {
-            emit(&a, "job-progress", Progress { id, fraction, detail })
+            emit(&a, "job-progress", Progress { id, fraction, detail, extra: None })
         }
-        crate::engine::Event::StepDone { .. } => {}
+        crate::engine::Event::StepDone { .. } | crate::engine::Event::StepStarted { .. } => {}
     });
     crate::engine::run_steps(id, steps, None, &sink)
 }
@@ -426,11 +440,11 @@ pub fn cancel(id: u64) {
 
 pub fn ai_started(app: &AppHandle, id: u64, title: String, via: String) {
     crate::show_hud(app);
-    emit(app, "job-started", Started { id, title, family: "ai".into(), ring: false, via: Some(via) });
+    emit(app, "job-started", Started { id, title, family: "ai".into(), ring: false, via: Some(via), folder: false });
 }
 
 pub fn ai_progress(app: &AppHandle, id: u64, fraction: f64, detail: String) {
-    emit(app, "job-progress", Progress { id, fraction, detail });
+    emit(app, "job-progress", Progress { id, fraction, detail, extra: None });
 }
 
 pub fn ai_done(app: &AppHandle, id: u64, ok: bool, title: String, body: String, outputs: Vec<PathBuf>, via: Option<String>) {
@@ -468,14 +482,194 @@ pub fn reveal(id: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// Moves a job's outputs to the Recycle Bin / Trash.
+/// Moves a job's outputs to the Recycle Bin / Trash (folder jobs: their new
+/// folders whole; after Replace, the originals come back too).
 pub fn undo(id: u64) -> Result<usize, String> {
     let files = outputs_map().lock().ok().and_then(|mut o| o.remove(&id)).unwrap_or_default();
+    let replaced = folder_jobs().lock().ok().and_then(|mut f| f.get_mut(&id).map(|j| (std::mem::take(&mut j.replaced), j.started)));
+    let mut n = 0;
+    if let Some((list, _)) = replaced.filter(|(l, _)| !l.is_empty()) {
+        n += crate::folder::undo_replace(&list)?;
+    }
     let existing: Vec<&PathBuf> = files.iter().filter(|p| p.exists()).collect();
     if existing.is_empty() {
-        return Ok(0);
+        return Ok(n);
     }
     trash::delete_all(&existing).map_err(|e| format!("Couldn't move to the Recycle Bin: {e}"))?;
     log::info!("job {id}: undone, {} file(s) moved to the bin", existing.len());
     Ok(existing.len())
+}
+
+// ---------- folder jobs (see folder.rs) ----------
+
+/// A folder job, kept for Undo of Replace and for "Carry on".
+struct FolderJob {
+    plan: crate::folder::Plan,
+    /// Files that weren't started (Stop after this file).
+    left: Vec<PathBuf>,
+    replaced: Vec<(PathBuf, PathBuf, PathBuf)>,
+    started: Option<std::time::SystemTime>,
+    ring: bool,
+}
+
+fn folder_jobs() -> &'static Mutex<HashMap<u64, FolderJob>> {
+    static F: OnceLock<Mutex<HashMap<u64, FolderJob>>> = OnceLock::new();
+    F.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Starts a folder pick: plans it (measuring files can take a moment) and runs it. Returns its id.
+#[allow(clippy::too_many_arguments)]
+pub fn start_folder_planned(
+    app: AppHandle,
+    scan: std::sync::Arc<crate::folder::Scan>,
+    action: crate::folder::Action,
+    opts: crate::folder::Opts,
+    quality: Option<crate::settings::Quality>,
+    label: String,
+    ring: bool,
+) -> u64 {
+    let id = crate::engine::new_id();
+    std::thread::spawn(move || {
+        crate::procs::set_current_job(id);
+        report_downloads(&app, id);
+        if !ring {
+            crate::show_hud(&app);
+        }
+        emit(&app, "job-started", Started { id, title: format!("{label} · {}", scan.name()), family: "folder".into(), ring, via: None, folder: true });
+        emit(&app, "job-progress", Progress { id, fraction: 0.0, detail: "Getting ready…".into(), extra: None });
+        let prefs = crate::settings::get();
+        let q = quality.unwrap_or_else(|| prefs.quality.clone());
+        match crate::folder::plan(&scan, &action, &opts, &q, &prefs) {
+            Ok(plan) => run_folder(&app, id, plan, ring),
+            Err(e) if e.starts_with(crate::folder::ALREADY_DONE) => {
+                let body = e[crate::folder::ALREADY_DONE.len()..].to_string();
+                let body = format!("{}{}", body[..1].to_uppercase(), &body[1..]);
+                emit(&app, "job-done", Done { attention: true, ..Done::plain(id, true, "Nothing to do".into(), body, false) });
+            }
+            Err(e) => {
+                log::info!("folder job {id}: {e}");
+                let cancelled = crate::procs::is_cancelled(id);
+                let (title, body) = if cancelled { ("Stopped".to_string(), "Nothing was saved.".to_string()) } else { (format!("Couldn't start: {label}"), e) };
+                emit(&app, "job-done", Done::plain(id, false, title, body, false));
+            }
+        }
+    });
+    id
+}
+
+/// Starts an already planned folder job ("Carry on") and returns its id.
+pub fn start_folder(app: AppHandle, plan: crate::folder::Plan, ring: bool) -> u64 {
+    let id = crate::engine::new_id();
+    std::thread::spawn(move || {
+        crate::procs::set_current_job(id);
+        report_downloads(&app, id);
+        if !ring {
+            crate::show_hud(&app);
+        }
+        emit(&app, "job-started", Started { id, title: plan.title.clone(), family: "folder".into(), ring, via: None, folder: true });
+        run_folder(&app, id, plan, ring);
+    });
+    id
+}
+
+/// Runs a folder job on this thread and reports it.
+fn run_folder(app: &AppHandle, id: u64, plan: crate::folder::Plan, ring: bool) {
+    let (a1, a2) = (app.clone(), app.clone());
+    let on: crate::folder::OnLive = std::sync::Arc::new(move |l: crate::folder::Live| emit(&a1, "job-progress", Progress { id, fraction: l.fraction, detail: l.detail, extra: l.extra }));
+    let dl: crate::folder::OnDownload = std::sync::Arc::new(move |fraction, detail| emit(&a2, "job-progress", Progress { id, fraction, detail, extra: None }));
+    let started = Instant::now();
+    let o = crate::folder::run(id, &plan, on, dl);
+    log::info!("folder job {id}: {} done, {} failed, {} not started, {:?}", o.done, o.failed, o.not_started, started.elapsed());
+    let done = folder_done(id, &plan, &o);
+    if let Ok(mut out) = outputs_map().lock() {
+        // Replace leaves nothing new to remove (Undo puts the originals back),
+        // but Open folder still shows the results.
+        out.insert(id, if o.undo.is_empty() { o.made.clone() } else { o.undo.clone() });
+    }
+    if !o.pairs.is_empty() && plan.action == crate::folder::Action::Compress {
+        if let Ok(mut p) = pairs().lock() {
+            p.insert(id, o.pairs.clone());
+        }
+    }
+    if let Ok(mut f) = folder_jobs().lock() {
+        f.insert(id, FolderJob { plan, left: o.left.clone(), replaced: o.replaced.clone(), started: o.started, ring });
+    }
+    emit(app, "job-done", done);
+}
+
+fn folder_done(id: u64, plan: &crate::folder::Plan, o: &crate::folder::Outcome) -> Done {
+    use crate::folder::RowKind;
+    let summary = crate::folder::summary(plan, o);
+    let sizes = if o.before > 0 && o.after > 0 && o.before != o.after && !plan.is_single() {
+        let pct = (o.after as f64 / o.before as f64 * 100.0).round();
+        format!("{} → {} ({pct}% of the original)\n", human_size(o.before), human_size(o.after))
+    } else if plan.is_single() && o.after > 0 {
+        let made = o.made.first().map(|m| file_name(m)).unwrap_or_default();
+        format!("{made} · {}\n", human_size(o.after))
+    } else {
+        String::new()
+    };
+    let mut body = format!("{sizes}{summary}");
+    if let Some(h) = &o.holding {
+        body.push_str(&format!("\nThe originals are in {} (next to the folder): delete it when you're happy with the results.", h.display()));
+    }
+    for n in &o.notes {
+        body.push_str(&format!("\n{n}"));
+    }
+    let made_any = !o.made.is_empty() || !o.replaced.is_empty();
+    let compare = plan.action == crate::folder::Action::Compress && !o.pairs.is_empty();
+    let attention = o.rows.iter().any(|r| r.kind != RowKind::Done) || !o.notes.is_empty();
+    let details = Some(o.rows.clone());
+    let replaced = !o.replaced.is_empty();
+    if o.cancelled {
+        let title = "Stopped".to_string();
+        let body = if made_any { format!("{body}\nThe file in progress was removed.") } else { "Nothing was saved.".into() };
+        return Done { details, replaced, attention: true, ..Done::plain(id, made_any, title, body, made_any) };
+    }
+    if o.stopped {
+        let total = o.done + o.failed + o.kept + o.not_started;
+        let title = format!("Stopped after {} of {total}", total - o.not_started);
+        let body = format!("{body}\nThe other {} are untouched.", o.not_started);
+        return Done { details, replaced, attention: true, resume: Some(o.not_started), compare, ..Done::plain(id, true, title, body, made_any) };
+    }
+    if !made_any {
+        let first = o.rows.iter().find(|r| r.kind == RowKind::Failed).map(|r| format!("{}: {}", r.name, r.status));
+        let kept = o.rows.iter().any(|r| r.kind == RowKind::Kept);
+        if kept && o.failed == 0 {
+            return Done { details, attention: true, ..Done::plain(id, true, "Nothing to do".into(), body, false) };
+        }
+        return Done { details, attention: true, ..Done::plain(id, false, format!("Couldn't {}", plan.title.to_lowercase()), first.unwrap_or(body), false) };
+    }
+    let title = match plan.title.split_once(' ') {
+        _ if plan.is_single() => format!("{} · done", plan.title),
+        _ => format!("{} · {}", plan.title, if o.failed > 0 { "done, with failures" } else { "done" }),
+    };
+    Done { details, replaced, attention, compare, ..Done::plain(id, true, title, body, true) }
+}
+
+/// "Stop after this file" on a folder job's card.
+pub fn stop_after(id: u64) {
+    crate::procs::stop_after_current(id);
+}
+
+/// "Carry on" on a stopped folder job: the files it didn't start, as a new job.
+pub fn resume(app: AppHandle, id: u64) -> Result<u64, String> {
+    let (mut plan, left, ring) = {
+        let jobs = folder_jobs().lock().map_err(|_| "Busy")?;
+        let j = jobs.get(&id).ok_or("That job is gone.")?;
+        (j.plan.clone(), j.left.clone(), j.ring)
+    };
+    if left.is_empty() {
+        return Err("Every file was done.".into());
+    }
+    let keep: std::collections::HashSet<PathBuf> = left.into_iter().collect();
+    for g in plan.groups.iter_mut() {
+        g.retain(|st| st.inputs.iter().any(|f| keep.contains(f)));
+    }
+    plan.groups.retain(|g| !g.is_empty());
+    // The first job made the new folders; this one only adds to them.
+    plan.new_roots.clear();
+    plan.rows.retain(|r| r.kind == crate::folder::RowKind::Alone);
+    let _ = ring;
+    Ok(start_folder(app, plan, false))
 }

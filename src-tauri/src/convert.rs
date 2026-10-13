@@ -71,6 +71,9 @@ pub enum Op {
     Repack { to: archive::Pack },
     /// Camera JPG: the picture the camera stored inside a RAW file.
     CameraJpg { level: Option<Level>, fixed: u32 },
+    /// Folder jobs: copy, remove GPS, join clips, image sequences, one
+    /// spreadsheet, zip a folder (see folder.rs).
+    Folder(Box<crate::folder::FolderOp>),
     /// Compress to a size (None: the smallest that still looks the same).
     /// `quality`: the presets (as tuned) for the "looks the same" part.
     ToSize { kind: size::Kind, bytes: Option<u64>, trim: Option<f64>, quality: Box<Quality> },
@@ -126,7 +129,7 @@ fn mp3_vbr(kbps: u32) -> &'static str {
 
 /// FFmpeg audio encoder settings for an output extension. `mp3`: kbps asked
 /// for in Settings; `cap`: no point going far above a lossy source's bitrate.
-fn audio_codec_for(ext: &str, mp3: u32, cap: Option<u32>) -> Vec<String> {
+pub(crate) fn audio_codec_for(ext: &str, mp3: u32, cap: Option<u32>) -> Vec<String> {
     let at_most = |kbps: u32| cap.map_or(kbps, |c| kbps.min(c.max(64)));
     let kb = |kbps: u32| format!("{}k", at_most(kbps));
     match ext {
@@ -423,6 +426,13 @@ fn not_yet(target_id: &str) -> String {
 thread_local! {
     /// A folder the command line or MCP asked for (`--out`), for jobs on this thread.
     static OUT_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    /// Folder jobs: each step's own folder is where its result goes (created if needed).
+    static EXACT_DIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Saves this thread's conversions in each step's own folder, exactly (folder jobs).
+pub fn set_exact_dirs(on: bool) {
+    EXACT_DIRS.with(|e| e.set(on));
 }
 
 /// Saves this thread's conversions in `dir` (None: next to the originals, or the Settings folder).
@@ -438,7 +448,7 @@ pub fn unique_output(dir: &Path, stem: &str, ext: &str) -> PathBuf {
     free_name(dir, stem, ext, &HashSet::new())
 }
 
-fn free_name(dir: &Path, stem: &str, ext: &str, taken: &HashSet<PathBuf>) -> PathBuf {
+pub(crate) fn free_name(dir: &Path, stem: &str, ext: &str, taken: &HashSet<PathBuf>) -> PathBuf {
     let name = |suffix: &str| {
         if ext.is_empty() { format!("{stem}{suffix}") } else { format!("{stem}{suffix}.{ext}") }
     };
@@ -489,6 +499,10 @@ impl Drop for Reserved {
 /// Where a conversion of a file in `dir` is saved: there, or the one folder
 /// chosen in Settings; a read-only place falls back to Downloads.
 pub(crate) fn output_dir(dir: &Path) -> PathBuf {
+    if EXACT_DIRS.with(|e| e.get()) {
+        let _ = std::fs::create_dir_all(dir);
+        return writable_dir(dir);
+    }
     if let Some(folder) = OUT_OVERRIDE.with(|o| o.borrow().clone()) {
         let _ = std::fs::create_dir_all(&folder);
         return writable_dir(&folder);
@@ -581,7 +595,7 @@ fn ransomware_protection_on_cached() -> bool {
 }
 
 /// Moves a finished file or folder into place (copying across drives).
-fn move_into(from: &Path, to: &Path) -> Result<(), String> {
+pub(crate) fn move_into(from: &Path, to: &Path) -> Result<(), String> {
     if std::fs::rename(from, to).is_ok() {
         return Ok(());
     }
@@ -965,6 +979,7 @@ fn run_op(step: &Step, output: &Path, progress: &mut dyn FnMut(f64)) -> Result<P
         }
         Op::Video { job, opts } => video::run(input, *job, opts, output, progress),
         Op::ToSize { kind, bytes, trim, quality } => size::run(*kind, input, *bytes, *trim, quality, output, progress),
+        Op::Folder(op) => crate::folder::run_op(op, step, output, progress),
         Op::Data { to } => {
             data::convert(input, *to, output)?;
             Ok(output.to_path_buf())
@@ -1390,11 +1405,23 @@ pub(crate) fn run_ffmpeg(input: &Path, args: &[String], output: &Path, progress:
 
 /// FFmpeg working in `dir` (two-pass encoding writes its log there).
 pub(crate) fn run_ffmpeg_in(dir: Option<&Path>, input: &Path, args: &[String], output: &Path, progress: &mut dyn FnMut(f64)) -> Result<(), String> {
+    ffmpeg_with(dir, &[], input, args, output, None, progress)
+}
+
+/// FFmpeg with options for the input (`before`, e.g. "-f concat -safe 0") and,
+/// when the input doesn't say how long it is, the length in seconds for progress.
+pub(crate) fn run_ffmpeg_pre(before: &[String], input: &Path, args: &[String], output: &Path, total: Option<f64>, progress: &mut dyn FnMut(f64)) -> Result<(), String> {
+    ffmpeg_with(None, before, input, args, output, total, progress)
+}
+
+fn ffmpeg_with(dir: Option<&Path>, before: &[String], input: &Path, args: &[String], output: &Path, total: Option<f64>, progress: &mut dyn FnMut(f64)) -> Result<(), String> {
     let mut cmd = tools::command(&tools::require(Tool::Ffmpeg)?);
     if let Some(d) = dir {
         cmd.current_dir(d);
     }
-    cmd.args(["-hide_banner", "-nostdin", "-n", "-i"])
+    cmd.args(["-hide_banner", "-nostdin", "-n"])
+        .args(before)
+        .arg("-i")
         .arg(input)
         .args(args)
         .args(["-progress", "pipe:1", "-nostats"])
@@ -1406,7 +1433,7 @@ pub(crate) fn run_ffmpeg_in(dir: Option<&Path>, input: &Path, args: &[String], o
     let child = tracked.child();
 
     // FFmpeg prints the input's duration on stderr and progress on stdout.
-    let duration = Arc::new(Mutex::new(None::<f64>));
+    let duration = Arc::new(Mutex::new(total.filter(|t| *t > 0.0)));
     let stderr_text = Arc::new(Mutex::new(String::new()));
     let stderr = child.stderr.take().expect("piped");
     let (d2, t2) = (duration.clone(), stderr_text.clone());

@@ -21,3 +21,6 @@ more/stats-dump.cmd
 scripts/stats-dump.ps1
 more/stats-own.cmd
 _to_delete/
+
+# Claude's transfer copies (not published)
+.claude-tmp/

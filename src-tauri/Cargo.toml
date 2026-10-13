@@ -40,6 +40,8 @@ ssimulacra2 = "0.5"
 # Lossless PNG optimisation.
 oxipng = { version = "10", default-features = false, features = ["parallel"] }
 tauri-plugin-updater = "2"
+# Free space before a folder job writes gigabytes.
+fs4 = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
