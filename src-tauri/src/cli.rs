@@ -78,8 +78,8 @@ Folders (give one or more folders instead of files):
                        join, join-audio, sequence, sequence-gif, audio, normalize, no-gps,
                        extract, sheets, or a format (mp4, jpg, mp3, …) for every file it fits
   --into <where>       new (a new folder next to it, the default), beside (next to each
-                       original) or replace (the originals move to \"Convertino originals\"
-                       next to the folder once the new copy checks out)
+                       original) or replace (each original moves to the Holding Area,
+                       _Quarantine on its drive, once its new copy checks out)
   --no-subfolders      only the files directly in the folder
   --redo-done          convert files again even when an earlier result is still there
   --size <size> --as <a>  fit the folder in a size: as folder (a compressed copy, default),

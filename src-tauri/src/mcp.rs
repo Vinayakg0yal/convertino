@@ -92,7 +92,7 @@ A folder's path works on everything inside: compress, zip, 7z, join (clips into 
                     "quality": { "type": ["string", "number"], "description": "Optional. small, balanced or best (as tuned in Convertino; default: as set there; balanced = looks the same as the original), or a number: how close the result must look, on the preset's own score (pictures and PDFs about 70–87, video about 89–96)." },
                     "tune": { "type": "object", "description": "Optional one-off preset settings for this job: look (number), floor (30–90), png (quick|normal|thorough), stripGps (true removes the photo's GPS location), codec (h265|h264|av1), maxRes (2160|1440|1080|720|0), maxFps (60|30|0), audio (96|128|192), encoder (gpu|cpu|auto), effort (faster|medium|slower), recheck (1–20), checkDpi (110|150|200).", "additionalProperties": true },
                     "outFolder": { "type": "string", "description": "Optional absolute folder to save into instead of next to the originals (files only)." },
-                    "into": { "type": "string", "enum": ["new", "beside", "replace"], "description": "Folders only. Where results go: new (a new folder next to it, default), beside (next to each original), replace (the originals move to a \"Convertino originals\" folder next to it; only when the user asks)." },
+                    "into": { "type": "string", "enum": ["new", "beside", "replace"], "description": "Folders only. Where results go: new (a new folder next to it, default), beside (next to each original), replace (each original moves to the Holding Area, _Quarantine on its drive, once its new copy checks out; only when the user asks)." },
                     "subfolders": { "type": "boolean", "description": "Folders only. Include files in subfolders (default true)." }
                 },
                 "required": ["paths", "to"]
@@ -308,7 +308,7 @@ fn folder_tool(args: &Value, ctx: &Ctx, size: Option<size::Ask>, roots: Vec<Path
     let place = match opts.into {
         folder::Into::New => "in a new folder next to it",
         folder::Into::Beside => "next to each original",
-        folder::Into::Replace => "in place of the originals (the originals are in \"Convertino originals\" next to the folder)",
+        folder::Into::Replace => "in place of the originals (each original that checked out moved to the Holding Area, _Quarantine on its drive)",
     };
     let mut result = summary(&all, &[], place);
     result.text = format!("{}\n{}", lines.join("\n"), result.text);

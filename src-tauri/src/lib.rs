@@ -20,6 +20,7 @@ mod convert;
 mod data;
 mod engine;
 mod folder;
+mod holding;
 mod image_edit;
 mod install;
 mod jobs;
@@ -30,12 +31,14 @@ mod raw;
 mod report;
 mod settings;
 mod shell;
+mod siblings;
 mod size;
 mod stats;
 mod tools;
 mod try_preset;
 mod tune;
 mod update;
+mod verify;
 #[cfg(windows)]
 mod alt_click;
 #[cfg(target_os = "macos")]
@@ -1882,6 +1885,8 @@ pub fn run() {
             }
             update::start_background_checks(app.handle());
             watch::start(app.handle().clone());
+            // So Crofty's other tools (Drive Cleanup, Trimothy) can find this Convertino.
+            siblings::announce();
             log::info!("Convertino started");
             Ok(())
         })

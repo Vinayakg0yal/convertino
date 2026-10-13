@@ -1127,7 +1127,7 @@ function ago(secs) {
 function intoWords(w) {
   const name = w.path.split(/[\\/]/).filter(Boolean).pop() || w.path;
   const sfx = { "folder.compress": "compressed", "folder.gps": "no GPS", "folder.normalize": "normalized", "folder.audio": "mp3" }[w.action] || (w.action.split(".").pop() || "");
-  return { new: `Results go in “${name} (${sfx})” next to it`, beside: "Results go next to each original", replace: "The original moves to “Convertino originals” next to this folder once its new copy checks out" }[w.into];
+  return { new: `Results go in “${name} (${sfx})” next to it`, beside: "Results go next to each original", replace: "The original moves to the Holding Area once its new copy looks, sounds and plays the same" }[w.into];
 }
 
 async function renderWatch() {

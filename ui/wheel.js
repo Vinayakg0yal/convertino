@@ -275,7 +275,7 @@ function showFolderOptions(s) {
     html += `<fieldset class="opts-modes"><legend>Put the results</legend>` +
       radio("into", "new", "In a new folder next to it", `${f.name} (${suffix}), same subfolders inside`, o.into === "new") +
       radio("into", "beside", "Next to each original", `“name (${suffix})” beside each file`, o.into === "beside") +
-      radio("into", "replace", "Replace the originals", "Each original moves to “Convertino originals” next to the folder once its new copy checks out", o.into === "replace") +
+      radio("into", "replace", "Replace the originals", "Each original moves to the Holding Area once its new copy looks, sounds and plays the same", o.into === "replace") +
       `</fieldset>` + subs +
       check("skipDone", "Skip files already done", "A result from an earlier run that's still there and newer than the original", o.skipDone);
     if (kind === "compress") html += select("look", "Look", [["small", "Smaller: looks very close"], ["balanced", "Balanced: looks the same"], ["best", "Best: the same, even side by side"]], q.video);

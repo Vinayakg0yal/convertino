@@ -123,7 +123,7 @@ pub enum Alone {
     Link,
     /// Program folders nobody converts (.git, node_modules).
     Tooling,
-    /// "Convertino originals": originals a Replace job kept.
+    /// The Holding Area (`_Quarantine`), or "Convertino originals" from builds before 13 Oct 2026.
     Held,
 }
 
@@ -206,7 +206,7 @@ fn hidden_or_system(name: &str, meta: &std::fs::Metadata) -> Option<Alone> {
     None
 }
 
-/// Where Replace keeps the originals: a folder next to the folder, emptied by the person.
+/// Where Replace kept the originals before the shared Holding Area (13 Oct 2026); still skipped when scanning.
 pub const HOLDING: &str = "Convertino originals";
 
 const TOOLING_DIRS: &[&str] = &[".git", "node_modules", "$recycle.bin", "system volume information", "__pycache__", ".svn", ".hg"];
@@ -265,7 +265,7 @@ fn scan_with(roots: &[PathBuf], cancel: &AtomicBool, progress: &dyn Fn(usize), t
                 if meta.is_dir() {
                     let why = if TOOLING_DIRS.contains(&name.to_lowercase().as_str()) {
                         Some(Alone::Tooling)
-                    } else if name == HOLDING {
+                    } else if name == HOLDING || name.eq_ignore_ascii_case(crate::holding::DIR) {
                         Some(Alone::Held)
                     } else if let Some(w) = hidden_or_system(&name, &meta) {
                         Some(w)
@@ -456,7 +456,7 @@ pub enum Into {
     New,
     /// Next to each original ("clip (compressed).mp4").
     Beside,
-    /// The new file takes the original's place; the original goes to the Recycle Bin.
+    /// The new file takes the original's place once it checks out; the original goes to the Holding Area.
     Replace,
 }
 
@@ -745,7 +745,7 @@ fn into_words(into: Into, scan: &Scan, suffix: &str) -> String {
             }
         }
         Into::Beside => "→ next to each original".into(),
-        Into::Replace => format!("→ replaces the originals (they move to “{HOLDING}” next to the folder)"),
+        Into::Replace => "→ replaces each original once its copy checks out (the originals move to the Holding Area)".to_string(),
     }
 }
 
@@ -1220,9 +1220,10 @@ pub struct Plan {
     pub rows: Vec<Row>,
     /// Folders this job creates for its results (Undo removes them whole).
     pub new_roots: Vec<PathBuf>,
-    /// New results take the originals' places; the originals move here.
+    /// New results take the originals' places; the originals move to the Holding Area.
     pub replace: bool,
-    pub holding: Option<PathBuf>,
+    /// Replace: the Holding Area batch the originals go in ("2026-10-13-09-41-07 convertino").
+    pub holding: Option<String>,
     /// Scratch folders to remove when the job ends.
     pub scratch: Vec<PathBuf>,
     pub roots: Vec<PathBuf>,
@@ -1404,9 +1405,7 @@ pub fn plan(scan: &Scan, action: &Action, opts: &Opts, q: &Quality, prefs: &crat
             plan.replace = opts.into == Into::Replace;
             if plan.replace {
                 // Not the Recycle Bin: Windows deletes files too big for it without asking.
-                let parent = parent_of(scan);
-                let base = parent.join(HOLDING);
-                plan.holding = Some(convert::unique_output(&base, &single_stem(scan), ""));
+                plan.holding = Some(crate::holding::batch_name());
             }
             let job_tag = std::process::id();
             for (target, files) in by_target {
@@ -2237,7 +2236,7 @@ pub struct Outcome {
     pub pairs: Vec<(PathBuf, PathBuf)>,
     /// Replace: (new file in the original's place, the original's path, where the original is kept).
     pub replaced: Vec<(PathBuf, PathBuf, PathBuf)>,
-    /// Replace: the folder the originals were moved to.
+    /// Replace: the Holding Area batch folder the originals were moved to (the first one, when several drives).
     pub holding: Option<PathBuf>,
     pub rows: Vec<Row>,
     pub done: usize,
@@ -2304,8 +2303,29 @@ pub fn run(id: u64, plan: &Plan, on: OnLive, download: OnDownload) -> Outcome {
             break;
         }
         ran.insert(g);
+        // Replace: a video original must be sound before a copy may take its place.
+        let checked: Vec<Step>;
+        let group: &Vec<Step> = if plan.replace {
+            let mut keep = Vec::with_capacity(group.len());
+            for st in group {
+                if !st.folder && st.inputs.len() == 1 && !crate::procs::is_stopping(id) {
+                    on(Live { fraction: (offset as f64 / total_steps.max(1) as f64).clamp(0.0, 1.0), detail: format!("Checking {} before replacing it", file_name(&st.inputs[0])), extra: None });
+                    if let Err(e) = crate::verify::source_ok(&st.inputs[0]) {
+                        out.kept += 1;
+                        out.rows.push(Row { name: row_name(&scan_like, &st.inputs[0]), status: e, kind: RowKind::Kept });
+                        continue;
+                    }
+                }
+                keep.push(st.clone());
+            }
+            checked = keep;
+            &checked
+        } else {
+            group
+        };
         let group_len = group.len();
-        let off = offset;
+        // Files left alone by the check count as finished in "File N of M".
+        let off = offset + (plan.groups[g].len() - group_len);
         let sink: Sink = {
             let (tally, on, dl) = (saved.clone(), on.clone(), download.clone());
             Arc::new(move |e: Event| match e {
@@ -2343,7 +2363,7 @@ pub fn run(id: u64, plan: &Plan, on: OnLive, download: OnDownload) -> Outcome {
             })
         };
         let o = engine::run_steps_exact(id, group, &sink);
-        offset += group_len;
+        offset += plan.groups[g].len();
         out.cancelled |= o.cancelled;
         // What happened to each file of this group.
         let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -2355,16 +2375,25 @@ pub fn run(id: u64, plan: &Plan, on: OnLive, download: OnDownload) -> Outcome {
                 continue;
             }
             if plan.replace && plan.scratch.iter().any(|s| made.starts_with(s)) {
-                let held = plan.holding.as_ref().map(|h| h.join(held_rel(&plan.roots, &inputs[0])));
+                let held = plan.holding.as_ref().map(|batch| crate::holding::held_path(&inputs[0], batch));
+                let bytes = inputs[0].metadata().map(|m| m.len()).unwrap_or(0);
                 match held.ok_or_else(|| "No place to keep the original".to_string()).and_then(|held| replace_original(&inputs[0], made, &held).map(|f| (f, held))) {
                     Ok((final_path, held)) => {
-                        let (b, a) = (sizes(&inputs[0], made).0, engine::disk_size(&final_path));
+                        if let Err(e) = crate::holding::record(&held, &inputs[0], &final_path, bytes) {
+                            out.notes.push(format!("{}: {e}. The original is at {}", file_name(&inputs[0]), held.display()));
+                        }
+                        let batch_dir = crate::holding::batch_dir_of(&held);
+                        if out.holding.is_none() {
+                            out.holding = batch_dir;
+                        } else if batch_dir.is_some() && batch_dir != out.holding && !out.notes.iter().any(|n| n.starts_with("Originals from another drive")) {
+                            out.notes.push("Originals from another drive are in that drive's Holding Area.".into());
+                        }
+                        let (b, a) = (bytes, engine::disk_size(&final_path));
                         out.before += b;
                         out.after += a;
                         out.done += 1;
                         out.rows.push(Row { name: row_name(&scan_like, &inputs[0]), status: format!("Replaced · {} → {}", human_size(b), human_size(a)), kind: RowKind::Done });
                         out.replaced.push((final_path.clone(), inputs[0].clone(), held));
-                        out.holding = plan.holding.clone();
                         out.made_from.push((inputs.clone(), final_path.clone()));
                         out.made.push(final_path);
                     }
@@ -2473,32 +2502,9 @@ fn sizes(original: &Path, made: &Path) -> (u64, u64) {
     (original.metadata().map(|m| m.len()).unwrap_or(0), engine::disk_size(made))
 }
 
-/// The new copy checks out: there, not empty, and (video and sound) as long as the original.
+/// The new copy checks out: it looks, sounds and plays like the original (`verify::copy_ok`).
 fn checks_out(original: &Path, made: &Path) -> Result<(), String> {
-    let len = made.metadata().map(|m| m.len()).unwrap_or(0);
-    if len == 0 {
-        return Err("The new copy is empty".into());
-    }
-    let ext = original.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    if matches!(wheel::family_of(&ext).map(|f| f.0).as_deref(), Some("video" | "audio")) {
-        let (a, b) = (crate::video::probe(original).ok().and_then(|p| p.duration), crate::video::probe(made).ok().and_then(|p| p.duration));
-        if let (Some(a), Some(b)) = (a, b) {
-            if (a - b).abs() > (a * 0.02).max(1.5) {
-                return Err(format!("The new copy is {b:.0} s long, the original {a:.0} s"));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// An original's place inside the holding folder: its path inside the selected folder.
-fn held_rel(roots: &[PathBuf], original: &Path) -> PathBuf {
-    for r in roots {
-        if let Ok(rel) = original.strip_prefix(r) {
-            return if roots.len() > 1 { PathBuf::from(folder_name(r)).join(rel) } else { rel.to_path_buf() };
-        }
-    }
-    PathBuf::from(original.file_name().unwrap_or_default())
+    crate::verify::copy_ok(original, made)
 }
 
 /// Moves a file (renamed on the same drive; copied, checked and removed across drives).
@@ -2540,13 +2546,13 @@ fn replace_original(original: &Path, made: &Path, held: &Path) -> Result<PathBuf
 }
 
 /// Undo of a Replace: the new files go to the Recycle Bin / Trash and the
-/// originals move back from the holding folder. Returns how many came back.
+/// originals move back from the Holding Area. Returns how many came back.
 pub fn undo_replace(replaced: &[(PathBuf, PathBuf, PathBuf)]) -> Result<usize, String> {
     let mut back = 0;
     let mut problems = Vec::new();
     for (new, original, held) in replaced {
         if !held.exists() {
-            problems.push(format!("{} isn't in the holding folder any more", file_name(original)));
+            problems.push(format!("{} isn't in the Holding Area any more", file_name(original)));
             continue;
         }
         if new.exists() {
@@ -2556,36 +2562,18 @@ pub fn undo_replace(replaced: &[(PathBuf, PathBuf, PathBuf)]) -> Result<usize, S
             }
         }
         if original.exists() {
-            problems.push(format!("{} already exists; its original stays in the holding folder", file_name(original)));
+            problems.push(format!("{} already exists; its original stays in the Holding Area", file_name(original)));
             continue;
         }
         match move_checked(held, original) {
-            Ok(()) => back += 1,
+            Ok(()) => {
+                back += 1;
+                crate::holding::forget(held);
+            }
             Err(e) => problems.push(e),
         }
     }
-    // Empty folders left in the holding folder go.
-    if let Some((_, _, held)) = replaced.first() {
-        let top = held.ancestors().find(|a| a.parent().and_then(|p| p.file_name()).is_some_and(|n| n == HOLDING)).map(Path::to_path_buf);
-        if let Some(top) = top {
-            remove_empty(&top);
-            if let Some(p) = top.parent() {
-                let _ = std::fs::remove_dir(p);
-            }
-        }
-    }
     if problems.is_empty() { Ok(back) } else { Err(format!("{back} put back. {}", problems.join("; "))) }
-}
-
-fn remove_empty(dir: &Path) {
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            if e.path().is_dir() {
-                remove_empty(&e.path());
-            }
-        }
-    }
-    let _ = std::fs::remove_dir(dir);
 }
 
 /// The done card's summary: "42 compressed · 1 already small, kept · 1 couldn't be read · 2 left alone".
@@ -2933,6 +2921,7 @@ mod real_tests {
         if !have(&[Tool::Ffmpeg]) {
             return;
         }
+        let base = crate::holding::test_base();
         let d = dir("replace");
         clip(&d.join("c.mp4"), "320x240", 30, 1);
         std::fs::rename(d.join("c.mp4"), d.join("c.mkv")).unwrap();
@@ -2943,14 +2932,55 @@ mod real_tests {
         assert!(p.new_roots.is_empty());
         assert!(!original.exists());
         assert!(d.join("c.mp4").is_file());
-        let held = d.parent().unwrap().join(HOLDING).join(d.file_name().unwrap()).join("c.mkv");
+        let held = o.replaced[0].2.clone();
         assert_eq!(o.replaced, vec![(d.join("c.mp4"), original.clone(), held.clone())]);
+        assert!(held.starts_with(base.join(crate::holding::DIR)), "{}", held.display());
         assert!(held.is_file(), "the original is kept, not deleted");
+        // It is listed in its batch's manifest, with the file now in its place.
+        let batch = crate::holding::batch_dir_of(&held).unwrap();
+        let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(batch.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(m["entries"][0]["from"], original.to_string_lossy().as_ref());
+        assert_eq!(m["entries"][0]["replaced"], d.join("c.mp4").to_string_lossy().as_ref());
+        assert_eq!(o.holding.as_deref(), Some(batch.as_path()));
         // No scratch folder left behind.
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
         assert_eq!(undo_replace(&o.replaced).unwrap(), 1);
         assert!(original.is_file() && !d.join("c.mp4").exists() && !held.exists());
-        assert!(!d.parent().unwrap().join(HOLDING).join(d.file_name().unwrap()).exists(), "the empty holding folder goes");
+        assert!(!batch.exists(), "the emptied batch goes");
+    }
+
+    #[test]
+    fn replace_leaves_a_broken_recording_alone() {
+        if !have(&[Tool::Ffmpeg]) {
+            return;
+        }
+        let _ = crate::holding::test_base();
+        let d = dir("replace-broken");
+        // A recording whose slice headers are garbled (what broken NVIDIA DVR clips look like to the parser).
+        let src = d.join("clip.mts");
+        ffmpeg(&["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=4", "-c:v", "libx264", "-g", "15", src.to_str().unwrap()]);
+        let mut bytes = std::fs::read(&src).unwrap();
+        let (mut i, mut n) = (0, 0);
+        while i + 8 < bytes.len() {
+            if bytes[i..i + 3] == [0, 0, 1] && matches!(bytes[i + 3] & 0x1f, 1 | 5) {
+                if n % 2 == 0 {
+                    bytes[i + 4] ^= 0xff;
+                    bytes[i + 5] ^= 0xa5;
+                }
+                n += 1;
+            }
+            i += 1;
+        }
+        std::fs::write(&src, &bytes).unwrap();
+        let before = std::fs::read(&src).unwrap();
+        let opts = Opts { into: Into::Replace, ..Opts::default() };
+        let (_, o) = run_it(&d, Action::ConvertAll("video.mp4".into()), opts);
+        assert_eq!((o.done, o.kept, o.failed), (0, 1, 0), "{:?}", o.rows);
+        assert!(o.rows.iter().any(|r| r.kind == RowKind::Kept && r.status.contains("broken sections")), "{:?}", o.rows);
+        assert_eq!(std::fs::read(&src).unwrap(), before, "the original is untouched");
+        assert!(o.replaced.is_empty() && o.holding.is_none());
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1, "no copy or scratch folder left behind");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

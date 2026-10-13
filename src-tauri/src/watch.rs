@@ -207,10 +207,9 @@ fn convert_file(w: &Watched, file: &Path, busy: &dyn Fn(bool)) -> Option<(Vec<Pa
             return None;
         }
     };
-    // One holding folder per watched folder (not a new one for every file).
+    // One Holding Area batch per watched folder (not a new one for every file).
     if plan.replace {
-        let parent = dir.parent().map(Path::to_path_buf).unwrap_or_else(|| dir.clone());
-        plan.holding = Some(parent.join(folder::HOLDING).join(folder::folder_name(&dir)));
+        plan.holding = Some(format!("watched {} convertino", folder::folder_name(&dir)));
     }
     log::info!("watched {}: converting {name}", dir.display());
     busy(true);
@@ -301,11 +300,13 @@ mod tests {
         // A text file isn't a picture: nothing happens, nothing to report.
         assert!(convert_file(&w, &d.join("notes.txt"), &|_| {}).is_none());
         // Replace: the original moves to the watched folder's own holding folder.
+        let base = crate::holding::test_base();
         let w2 = Watched { into: Into::Replace, ..w };
         std::fs::remove_file(d.join("shot.jpg")).unwrap();
         let (made, _) = convert_file(&w2, &png, &|_| {}).unwrap();
         assert_eq!(made, vec![d.join("shot.jpg")]);
-        assert!(d.parent().unwrap().join(folder::HOLDING).join("Shots").join("shot.png").is_file());
+        let held = crate::holding::held_path(&png, &format!("watched {} convertino", folder::folder_name(&d)));
+        assert!(held.starts_with(&base) && held.is_file(), "{}", held.display());
         let _ = std::fs::remove_dir_all(d.parent().unwrap());
     }
 

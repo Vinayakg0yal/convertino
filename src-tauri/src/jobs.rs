@@ -611,7 +611,7 @@ fn folder_done(id: u64, plan: &crate::folder::Plan, o: &crate::folder::Outcome) 
     };
     let mut body = format!("{sizes}{summary}");
     if let Some(h) = &o.holding {
-        body.push_str(&format!("\nThe originals are in {} (next to the folder): delete it when you're happy with the results.", h.display()));
+        body.push_str(&format!("\nThe originals are in {}: delete that folder when you're happy with the results.", crate::holding::describe(h)));
     }
     for n in &o.notes {
         body.push_str(&format!("\n{n}"));
