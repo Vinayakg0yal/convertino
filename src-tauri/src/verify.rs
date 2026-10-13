@@ -70,46 +70,107 @@ pub fn source_ok(original: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// How alike one frame of `a` and `b` is at `t` seconds (SSIM 0..1); None when FFmpeg gave no score.
-/// `seek_b`: jump straight to `t` in `b` (videos). Animated pictures (GIF) don't seek reliably in
+/// Size of the grey frames compared.
+const FW: usize = 320;
+const FH: usize = 180;
+
+/// One frame of `p` at `t` seconds as small grey pixels; None when FFmpeg gave no frame.
+/// `seek`: jump straight to `t` (videos). Animated pictures (GIF) don't seek reliably in
 /// every FFmpeg build, so they are decoded from the start and trimmed to `t` instead.
-fn similarity_at(ff: &Path, a: &Path, b: &Path, t: f64, seek_b: bool) -> Result<Option<f64>, String> {
+///
+/// Each file is read by its own FFmpeg run and the two frames are compared here: a single
+/// FFmpeg run with both files and its `ssim` filter pairs frames by timing, and on a busy
+/// Windows PC it now and then paired the wrong ones (a good copy scored 0%).
+fn frame_at(ff: &Path, p: &Path, t: f64, seek: bool) -> Result<Option<Vec<u8>>, String> {
     let ts = format!("{t:.3}");
     let mut cmd = tools::command(ff);
-    cmd.args(["-hide_banner", "-nostdin", "-nostats", "-ss", &ts, "-i"]).arg(a);
-    let graph = if seek_b {
-        cmd.args(["-ss", &ts, "-i"]).arg(b);
-        "[0:v]scale=320:180,format=gray[x];[1:v]scale=320:180,format=gray[y];[x][y]ssim".to_string()
+    cmd.args(["-hide_banner", "-nostdin", "-nostats", "-v", "error"]);
+    let filter = if seek {
+        cmd.args(["-ss", &ts]);
+        format!("scale={FW}:{FH},format=gray")
     } else {
-        cmd.arg("-i").arg(b);
-        format!("[0:v]scale=320:180,format=gray[x];[1:v]trim=start={ts},setpts=PTS-STARTPTS,scale=320:180,format=gray[y];[x][y]ssim")
+        format!("trim=start={ts},setpts=PTS-STARTPTS,scale={FW}:{FH},format=gray")
     };
+    cmd.arg("-i").arg(p);
     let out = cmd
-        .args(["-frames:v", "1", "-lavfi", &graph, "-f", "null", "-"])
+        .args(["-map", "0:v:0", "-frames:v", "1", "-vf", &filter, "-f", "rawvideo", "-pix_fmt", "gray", "-"])
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("Couldn't start FFmpeg: {e}"))?;
-    let text = String::from_utf8_lossy(&out.stderr);
-    Ok(text.lines().rev().find_map(|l| l.split("All:").nth(1)).and_then(|r| r.split_whitespace().next()?.parse().ok()))
+    let mut px = out.stdout;
+    if px.len() < FW * FH {
+        return Ok(None);
+    }
+    px.truncate(FW * FH);
+    Ok(Some(px))
 }
 
-/// SSIM of one frame, trying the fast seek first; Err when no comparison was possible at all.
-fn similarity(ff: &Path, a: &Path, b: &Path, t: f64, picture: bool) -> Result<f64, String> {
-    let mut fast = None;
-    if !picture {
-        fast = similarity_at(ff, a, b, t, true)?;
-        if let Some(s) = fast.filter(|s| *s >= MIN_MATCH) {
-            return Ok(s);
+/// SSIM of two grey frames (0..1), the way FFmpeg's `ssim` filter scores them:
+/// 8×8 windows stepping 4 pixels.
+fn ssim(a: &[u8], b: &[u8], w: usize, h: usize) -> f64 {
+    let (bw, bh) = (w / 4, h / 4);
+    // Sums per 4×4 block: a, b, a²+b², a·b.
+    let mut sums = vec![[0f64; 4]; bw * bh];
+    for by in 0..bh {
+        for bx in 0..bw {
+            let s = &mut sums[by * bw + bx];
+            for y in by * 4..by * 4 + 4 {
+                for x in bx * 4..bx * 4 + 4 {
+                    let (p, q) = (a[y * w + x] as f64, b[y * w + x] as f64);
+                    s[0] += p;
+                    s[1] += q;
+                    s[2] += p * p + q * q;
+                    s[3] += p * q;
+                }
+            }
         }
     }
-    // A low score from the fast seek is checked again by decoding the copy from the start:
-    // on Windows a seek now and then lands on the wrong frame (seen once as 0% on a good copy).
-    // A copy that really differs scores low both ways.
-    match similarity_at(ff, a, b, t, false)? {
-        Some(s) => Some(fast.map_or(s, |f: f64| f.max(s))),
-        None => fast,
+    let c1 = (0.01f64 * 0.01 * 255.0 * 255.0 * 64.0 + 0.5).floor();
+    let c2 = (0.03f64 * 0.03 * 255.0 * 255.0 * 64.0 * 63.0 + 0.5).floor();
+    let (mut total, mut n) = (0.0, 0usize);
+    for y in 0..bh.saturating_sub(1) {
+        for x in 0..bw.saturating_sub(1) {
+            let mut s = [0f64; 4];
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let k = &sums[(y + dy) * bw + x + dx];
+                for i in 0..4 {
+                    s[i] += k[i];
+                }
+            }
+            let [s1, s2, ss, s12] = s;
+            let vars = ss * 64.0 - s1 * s1 - s2 * s2;
+            let covar = s12 * 64.0 - s1 * s2;
+            total += (2.0 * s1 * s2 + c1) * (2.0 * covar + c2) / ((s1 * s1 + s2 * s2 + c1) * (vars + c2));
+            n += 1;
+        }
     }
-    .ok_or_else(|| format!("The new copy couldn't be compared with the original around {t:.0} s, so the original was kept"))
+    if n == 0 { 0.0 } else { total / n as f64 }
+}
+
+/// SSIM of one frame of `a` and `b` at `t`; Err when no comparison was possible at all.
+fn similarity(ff: &Path, a: &Path, b: &Path, t: f64, picture: bool) -> Result<f64, String> {
+    let fail = || format!("The new copy couldn't be compared with the original around {t:.0} s, so the original was kept");
+    let fa = frame_at(ff, a, t, true)?.ok_or_else(fail)?;
+    let mut best = None;
+    if !picture {
+        if let Some(fb) = frame_at(ff, b, t, true)? {
+            let s = ssim(&fa, &fb, FW, FH);
+            if s >= MIN_MATCH {
+                return Ok(s);
+            }
+            best = Some(s);
+        }
+    }
+    // A low score from the seek is checked again by decoding the copy from the start
+    // (a seek can land a frame or two off). A copy that really differs scores low both ways.
+    match frame_at(ff, b, t, false)? {
+        Some(fb) => {
+            let s = ssim(&fa, &fb, FW, FH);
+            Some(best.map_or(s, |f: f64| f.max(s)))
+        }
+        None => best,
+    }
+    .ok_or_else(fail)
 }
 
 /// Does `p` decode for 4 s from `at` with no complaints?
@@ -207,6 +268,40 @@ mod tests {
         let s = "[h264 @ 0x1] decode_slice_header error\n[h264 @ 0x1] no frame!\n[h264 @ 0x1] non-existing PPS 0 referenced\nfine line\n";
         assert_eq!(damage_lines(s), 3);
         assert_eq!(damage_lines(""), 0);
+    }
+
+    #[test]
+    fn ssim_scores_like_ffmpegs_filter() {
+        let flat = vec![128u8; FW * FH];
+        assert!((ssim(&flat, &flat, FW, FH) - 1.0).abs() < 1e-9);
+        let Some(ff) = ff() else { return };
+        let d = dir("ssim");
+        let src = d.join("src.mp4");
+        let s = src.to_string_lossy().into_owned();
+        run(&ff, &["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=3", "-c:v", "mpeg4", "-q:v", "2", &s]);
+        let small = d.join("small.mp4");
+        run(&ff, &["-i", &s, "-c:v", "mpeg4", "-q:v", "15", "-vf", "scale=320:180", &small.to_string_lossy()]);
+        let a = frame_at(&ff, &src, 1.5, true).unwrap().unwrap();
+        let b = frame_at(&ff, &small, 1.5, true).unwrap().unwrap();
+        let ours = ssim(&a, &b, FW, FH);
+        // FFmpeg's own score of the same two grey frames.
+        let (pa, pb) = (d.join("a.gray"), d.join("b.gray"));
+        std::fs::write(&pa, &a).unwrap();
+        std::fs::write(&pb, &b).unwrap();
+        let size = format!("{FW}x{FH}");
+        let out = std::process::Command::new(&ff)
+            .args(["-hide_banner", "-nostdin", "-f", "rawvideo", "-pix_fmt", "gray", "-s", &size, "-i"])
+            .arg(&pa)
+            .args(["-f", "rawvideo", "-pix_fmt", "gray", "-s", &size, "-i"])
+            .arg(&pb)
+            .args(["-lavfi", "[0:v][1:v]ssim", "-f", "null", "-"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        let theirs: f64 = text.lines().rev().find_map(|l| l.split("All:").nth(1)).and_then(|r| r.split_whitespace().next()?.parse().ok()).unwrap();
+        assert!((ours - theirs).abs() < 0.001, "ours {ours}, FFmpeg {theirs}");
+        assert!(ours > 0.8 && ours < 1.0, "{ours}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -51,6 +51,9 @@ Usage:
   convertino tools                       which converters are ready
   convertino tools install <name|--all>  download converters now
   convertino mcp                         run as an MCP server (AI apps start this)
+  convertino check <video> [copy]        is the video sound (no broken sections)? With a
+                                         copy: does it look, sound and play like the
+                                         original? (what Replace checks; --json)
 
 Options:
   --to <format>        a format or an action: jpg, webp, mp3, compress, split, merge,
@@ -126,6 +129,8 @@ pub enum Command {
     ToolsStatus { json: bool },
     ToolsInstall { names: Vec<String>, all: bool, json: bool },
     Mcp,
+    /// `check <original> [copy]`: the checks Replace runs, for other tools (Trimothy).
+    Check { original: PathBuf, copy: Option<PathBuf>, json: bool },
     Setup(Vec<String>),
     Version,
     Help,
@@ -163,6 +168,15 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         Some("mcp") if args.len() == 1 => return Ok(Command::Mcp),
         // Used by the Windows installer and uninstaller.
         Some("setup") => return Ok(Command::Setup(args[1..].to_vec())),
+        Some("check") => {
+            let json = args.iter().any(|a| a == "--json");
+            let files: Vec<PathBuf> = args[1..].iter().filter(|a| a.as_str() != "--json").map(PathBuf::from).collect();
+            return match files.as_slice() {
+                [original] => Ok(Command::Check { original: original.clone(), copy: None, json }),
+                [original, copy] => Ok(Command::Check { original: original.clone(), copy: Some(copy.clone()), json }),
+                _ => Err(usage("check takes a video, and optionally its copy.")),
+            };
+        }
         _ => {}
     }
     let mut c = ConvertArgs::default();
@@ -1157,6 +1171,31 @@ fn init_logging() {
 }
 
 /// Entry point of the `convertino` command. Returns the exit code.
+/// `convertino check`: exit 0 when it checks out, 1 with the reason when not.
+fn run_check(original: &Path, copy: Option<&Path>, json: bool) -> i32 {
+    let missing = [Some(original), copy].into_iter().flatten().find(|p| !p.is_file());
+    let result = match missing {
+        Some(p) => Err(format!("{} isn't there", p.display())),
+        None => match copy {
+            None => crate::verify::source_ok(original),
+            Some(c) => crate::verify::copy_ok(original, c),
+        },
+    };
+    if json {
+        let v = match &result {
+            Ok(()) => serde_json::json!({ "schema": 1, "ok": true }),
+            Err(why) => serde_json::json!({ "schema": 1, "ok": false, "why": why }),
+        };
+        outln!("{v}");
+    } else {
+        match &result {
+            Ok(()) => outln!("✓ checks out"),
+            Err(why) => errln!("✗ {why}"),
+        }
+    }
+    if result.is_ok() { EXIT_OK } else { EXIT_FAILED }
+}
+
 pub fn main() -> i32 {
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     init_logging();
@@ -1181,6 +1220,7 @@ pub fn main() -> i32 {
         }
         Command::Mcp => crate::mcp::serve(),
         Command::Setup(a) => crate::shell::setup(&a),
+        Command::Check { original, copy, json } => run_check(&original, copy.as_deref(), json),
         Command::Formats { files, json } => run_formats(&files, json),
         Command::ToolsStatus { json } => run_tools_status(json),
         Command::ToolsInstall { names, all, json } => run_tools_install(&names, all, json),
@@ -1292,6 +1332,9 @@ mod tests {
         assert_eq!(parse(&args(&["--help"])).unwrap(), Command::Help);
         assert_eq!(parse(&args(&["-V"])).unwrap(), Command::Version);
         assert_eq!(parse(&args(&["mcp"])).unwrap(), Command::Mcp);
+        assert_eq!(parse(&args(&["check", "a.mp4", "--json"])).unwrap(), Command::Check { original: "a.mp4".into(), copy: None, json: true });
+        assert_eq!(parse(&args(&["check", "a.mp4", "b.mp4"])).unwrap(), Command::Check { original: "a.mp4".into(), copy: Some("b.mp4".into()), json: false });
+        assert!(parse(&args(&["check"])).is_err());
         assert_eq!(parse(&args(&["tools"])).unwrap(), Command::ToolsStatus { json: false });
         assert_eq!(parse(&args(&["tools", "install", "--all", "--json"])).unwrap(), Command::ToolsInstall { names: vec![], all: true, json: true });
         assert!(parse(&args(&["tools", "install"])).is_err());
