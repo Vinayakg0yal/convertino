@@ -345,6 +345,7 @@ unsafe fn dialog_selection(dlg: HWND) -> Res<Selection> {
                 source: "Save dialog".into(),
                 paths: strings(vec![target]),
                 pending_dialog: Some(dlg.0 as isize),
+                ..Default::default()
             });
         }
     }
